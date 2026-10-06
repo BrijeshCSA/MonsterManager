@@ -2,13 +2,16 @@
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.utils import get_random_id
-import sqlite3, random, time, json
+import sqlite3, random, time, json, os
 from datetime import datetime
 
 # ============ НАСТРОЙКИ ============
-TOKEN = "vk1.a.v6vj5u-rSXJUC9AXuCk7LWUumtS9j5q6JZniSS9OYyg5UwzWUq5aE4KPDrp1RzQWFnswcI0IPRCn-1ScSqM4VqUyaJPWL09pNy8pcu6DtqZTzqG4kQEqKmafOpXH4Y4BAATnV3aHwIWs7AfUYfjy14NohuEHUbyYYrbh1E_YMdcSMzW1OJmKuvXQXBEF9oBnb5TyKTgtYKGsuyUTFhJ6Og"
-GROUP_ID = 242006213
-MAIN_OWNER = 889701916
+TOKEN = os.getenv("VK_TOKEN")
+GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
+MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
+
+if not TOKEN:
+    raise SystemExit("❌ Не задан VK_TOKEN! Добавь переменную окружения VK_TOKEN в Bothost.")
 
 # ============ БАЗА ============
 conn = sqlite3.connect('bot.db', check_same_thread=False)
@@ -290,13 +293,11 @@ def handle_message(peer_id, uid, text, message_id=None):
     args = text.split()
     cmd = args[0].lower() if args else ""
 
-    # Бан
     if is_banned(uid) and not is_owner(uid):
         ch = peer_to_chat(peer_id)
         if ch: kick_user(ch, uid)
         return
 
-    # Мут
     if is_muted(uid) > 0 and not is_admin(uid):
         if message_id: delete_message(peer_id, message_id)
         return
@@ -628,6 +629,14 @@ def handle_message(peer_id, uid, text, message_id=None):
     if cmd == "/выборы":
         c = get_country_of(uid)
         if not c: return send(peer_id,"❌ Нет страны", kb_country())
+        if len(args) > 1 and args[1].lower() == "начать":
+            if not is_president(uid): return send(peer_id,"❌ Только президент", kb_country())
+            cur.execute("SELECT id FROM elections WHERE country=? AND active=1",(c,))
+            if cur.fetchone(): return send(peer_id,"❌ Выборы уже идут", kb_country())
+            cur.execute("INSERT INTO elections(country,started) VALUES(?,?)",(c,int(time.time())))
+            conn.commit()
+            send(peer_id, f"🗳️ Выборы в {c} начались!\n/выдвинуться — участвовать\n/голос <id> — голосовать", kb_country())
+            return
         cur.execute("SELECT id,active FROM elections WHERE country=? AND active=1",(c,))
         e = cur.fetchone()
         if not e:
@@ -1263,7 +1272,6 @@ def handle_message(peer_id, uid, text, message_id=None):
 
     if text.startswith("/"):
         send(peer_id, f"❓ {cmd} не найдена. /help")
-
 
 # ============ АВТОКИК ============
 def handle_chat_invite(peer_id, member_id):
