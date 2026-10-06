@@ -272,21 +272,20 @@ def play_game(peer_id, uid, game, bet):
     if bet <= 0: return send(peer_id, "❌ Ставка должна быть больше 0")
     if get_balance(uid) < bet: return send(peer_id, f"❌ Недостаточно средств!\n💳 Баланс: {fmt(get_balance(uid))} 💵")
     emoji, name, desc = GAMES_INFO.get(game, ("🎮", "ИГРА", "Играй!"))
-    old_bal = get_balance(uid)
 
     # ---------- СЛОТЫ ----------
     if game == "/слоты":
         r = random.random()
         icons = ["🍒","🍋","💎","7️⃣","⭐","🔔","🍀"]
-        if r < 0.10:  # 10% - ДЖЕКПОТ x3
+        if r < 0.10:
             e = random.choice(icons); reel = [e,e,e]; win = bet * 3; kind = "jackpot"
-        elif r < 0.60:  # 50% - x2
+        elif r < 0.60:
             e = random.choice(icons)
             other = random.choice([i for i in icons if i != e])
             pos = random.randint(0,2)
             reel = [e,e,other] if pos==0 else ([e,other,e] if pos==1 else [other,e,e])
             win = bet * 2; kind = "win2"
-        else:  # 40% - проигрыш
+        else:
             reel = random.sample(icons, 3); win = -bet; kind = "lose"
 
         upd_balance(uid, win)
@@ -325,7 +324,7 @@ def play_game(peer_id, uid, game, bet):
                    f"{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- ОСТАЛЬНЫЕ — 50/50 ----------
+    # ---------- 50/50 ----------
     win_flag = random.random() < 0.5
     win = bet if win_flag else -bet
     upd_balance(uid, win)
@@ -377,7 +376,7 @@ def mafia_start(peer_id, uid, chat_id):
     for i,u in enumerate(g['players']):
         g['roles'][u] = roles[i]; send_uid(u, f"🎭 Твоя роль: *{roles[i].upper()}*")
     g['alive'] = list(g['players']); g['state']='night'; g['day']=1; g['night']={}
-    send(peer_id, f"{header('НОЧЬ 1')}\n\nГород засыпает...")
+    send(peer_id, header('НОЧЬ 1') + "\n\nГород засыпает...")
     send_uid(g['host'], "💡 Мафия должна написать /мафия_убить <id>")
 def mafia_kill(peer_id, uid, target):
     chat_id = peer_id - 2000000000 if peer_id >= 2000000000 else peer_id
@@ -406,9 +405,9 @@ def mafia_resolve(peer_id, chat_id):
     if not maf: send(peer_id, txt + "🎉 ГОРОД ПОБЕДИЛ!"); del MAFIA[chat_id]; return
     if len(maf) >= len(town): send(peer_id, txt + "🔪 МАФИЯ ПОБЕДИЛА!"); del MAFIA[chat_id]; return
     g['day'] += 1; g['state']='night'; g['night']={}
-    send(peer_id, txt + header("НОЧЬ " + str(g['day'])) + "\n\nМафия выбирает жертву.")
+    send(peer_id, txt + header('НОЧЬ ' + str(g['day'])) + "\n\nМафия выбирает жертву.")
 
-# ============ АЛИАСЫ ТЕКСТОВЫХ КНОПОК ============
+# ============ АЛИАСЫ ============
 TEXT_ALIASES = {
     "💰 баланс":"/баланс","🏆 топ":"/топ","🎰 клуб":"/клуб","🎲 казино":"/казино",
     "🌍 страна":"/страна","📘 паспорт":"/паспорт","🎁 приз":"/приз","📋 задания":"/задания",
@@ -432,6 +431,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not is_owner(uid): return send(peer_id, "❌ Только главный владелец")
         cur.execute("INSERT OR REPLACE INTO bot_disabled(peer_id,since) VALUES(?,?)", (peer_id, int(time.time())))
         conn.commit(); send(peer_id, "🛑 Бот выключен в этом чате.\nВключить: /start"); return
+
     # ---------- /start ----------
     if cmd == "/start":
         if is_bot_disabled(peer_id):
@@ -476,11 +476,12 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             f"🎭 /ивент /мафия — игра\n"
             f"🎭 /role /setrole /grole /staff /gstaff\n"
             f"👑 /nick /rnick /стата /cmd\n"
-            f"🎟️ /promo /promolist\n"
+            f"🎟️ /promo /promolist /createpromo\n"
             f"🛡️ /warn /mute /kick /ban /обнулить /вайп\n"
+            f"🚪 /q — покинуть чат (кик)\n"
             f"👑 /start /stop — вкл/выкл бота", kb_back()); return
 
-    # ================= ИГРЫ (выбор через кнопку) =================
+    # ================= ИГРЫ =================
     if cmd in GAMES_INFO:
         if len(args) < 2:
             set_game_state(uid, cmd)
@@ -595,10 +596,26 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if t==uid or get_balance(uid)<bet or get_balance(t)<bet: return send(peer_id,"❌", kb_games())
         if random.random()<0.5:
             upd_balance(uid,bet); upd_balance(t,-bet)
-            send(peer_id, f"⚔️{ D I V }\n   ПОБЕДА в дуэли!\n{DIV}\n\n  🏆 {mention(uid)} победил\n  💰 +{fmt(bet)} 💵", kb_games())
+            txt = (f"⚔️{DIV}⚔️\n"
+                   f"     🏆 ПОБЕДА в дуэли!\n"
+                   f"{DIV}\n\n"
+                   f"  🥇 Победитель: {mention(uid)}\n"
+                   f"  💀 Проигравший: {mention(t)}\n"
+                   f"  💰 Ставка: {fmt(bet)} 💵\n"
+                   f"  🎁 Выигрыш: +{fmt(bet)} 💵\n\n"
+                   f"{DIV}")
+            send(peer_id, txt, kb_games())
         else:
             upd_balance(uid,-bet); upd_balance(t,bet)
-            send(peer_id, f"⚔️{DIV}\n   ПОРАЖЕНИЕ\n{DIV}\n\n  🏆 {mention(t)} победил\n  💸 -{fmt(bet)} 💵", kb_games())
+            txt = (f"⚔️{DIV}⚔️\n"
+                   f"     💀 ПОРАЖЕНИЕ\n"
+                   f"{DIV}\n\n"
+                   f"  🥇 Победитель: {mention(t)}\n"
+                   f"  💀 Проигравший: {mention(uid)}\n"
+                   f"  💰 Ставка: {fmt(bet)} 💵\n"
+                   f"  💸 Потеря: -{fmt(bet)} 💵\n\n"
+                   f"{DIV}")
+            send(peer_id, txt, kb_games())
         return
 
     # ================= КЛУБ =================
@@ -1122,7 +1139,22 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/rules":
         send(peer_id, card("📜 УСТАВ", [("1️⃣","Субординация"),("2️⃣","Без мата"),
             ("3️⃣","Без спама"),("4️⃣","Приказы"),("5️⃣","3 варна → исключение")])); return
-    if cmd == "/q": send(peer_id,"🚪 Покинули расположение"); return
+
+    # ================= /q — покинуть чат =================
+    if cmd == "/q":
+        if not chat_id:
+            return send(peer_id, "🚪 Команда работает только в беседе")
+        if is_owner(uid) or is_admin(uid):
+            return send(peer_id, "❌ Админов и владельца кикать нельзя")
+        try:
+            send(peer_id, f"🚪 {mention(uid)} покидает расположение...")
+        except: pass
+        ok = kick_user(chat_id, uid)
+        if not ok:
+            send(peer_id, "❌ Не удалось выйти. Бот должен быть админом беседы.")
+        return
+
+    # ================= ПРОМО =================
     if cmd == "/promo":
         if len(args)<2: return
         code = args[1].upper()
@@ -1131,12 +1163,35 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if p[1]>=p[2]: return send(peer_id,"❌ Исчерпан")
         cur.execute("UPDATE promos SET uses=uses+1 WHERE code=?",(code,)); conn.commit()
         upd_balance(uid,p[0]); send(peer_id,f"🎟️ +{fmt(p[0])} 💵"); return
+
+    if cmd == "/createpromo":
+        if not is_owner(uid): return send(peer_id, "❌ Только главный владелец")
+        if len(args) < 4:
+            return send(peer_id, "📝 /createpromo <код> <сумма> <кол-во>")
+        code = args[1].upper()
+        try:
+            amount = int(args[2]); uses = int(args[3])
+        except:
+            return send(peer_id, "❌ Сумма и кол-во — числа")
+        if amount <= 0 or uses <= 0:
+            return send(peer_id, "❌ Сумма и кол-во > 0")
+        cur.execute("INSERT OR REPLACE INTO promos(code,amount,uses,max_uses) VALUES(?,?,0,?)",
+                    (code, amount, uses))
+        conn.commit()
+        send(peer_id, card("🎟️ ПРОМОКОД СОЗДАН", [
+            ("🔑 Код", code),
+            ("💰 Сумма", f"{fmt(amount)} 💵"),
+            ("👥 Активаций", str(uses)),
+        ], "Пользователи: /promo " + code)); return
+
     if cmd == "/promolist":
         cur.execute("SELECT code,amount,uses,max_uses FROM promos"); rows=cur.fetchall()
         if not rows: return send(peer_id,"Нет промо")
         txt = header("ПРОМОКОДЫ")+"\n\n"
-        for c,a,u,m in rows: txt += f"  🎟️ {c} — {fmt(a)} ({u}/{m})\n"
-        send(peer_id, txt + f"\n{DIV}"); return
+        for c,a,u,m in rows:
+            txt += f"  🎟️ {c} — {fmt(a)} 💵 ({u}/{m})\n"
+        txt += f"\n{DIV}\n👑 Создать: /createpromo <код> <сумма> <кол-во>"
+        send(peer_id, txt); return
 
     # ================= МОДЕРАЦИЯ =================
     if cmd == "/warn":
