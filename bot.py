@@ -66,6 +66,7 @@ def init_db():
         PRIMARY KEY(user_id, command))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS chat_staff(chat_id INTEGER, user_id INTEGER,
         position TEXT, PRIMARY KEY(chat_id, user_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS bot_disabled(peer_id INTEGER PRIMARY KEY, since INTEGER)""")
     conn.commit()
     for r, lvl in [("Глава",10),("Заместитель",8),("Модератор",5),("Хелпер",3),("Участник",1)]:
         try: cur.execute("INSERT OR IGNORE INTO roles(name,level,created_by,created_at) VALUES(?,?,?,?)",
@@ -105,6 +106,10 @@ def is_banned(uid):
 
 def peer_to_chat(p): return p - 2000000000 if p >= 2000000000 else None
 def fmt(n): return f"{n:,}".replace(",", " ")
+
+def is_bot_disabled(peer_id):
+    cur.execute("SELECT peer_id FROM bot_disabled WHERE peer_id=?", (peer_id,))
+    return bool(cur.fetchone())
 
 def name_of(uid):
     cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); r = cur.fetchone()
@@ -209,7 +214,6 @@ def card(title, rows, footer=None):
     return txt
 
 def kb(btns): return json.dumps({"one_time": False, "buttons": btns}, ensure_ascii=False)
-
 def kbt(label, cmd):
     return {"action":{"type":"text","label":label,"payload":json.dumps({"cmd":cmd})},"color":"primary"}
 def kbc(label, cmd, color="positive"):
@@ -273,7 +277,8 @@ def mafia_start(peer_id, uid, chat_id):
     send_uid(g['host'], "💡 Мафия должна написать /мафия_убить <id>")
 
 def mafia_kill(peer_id, uid, target):
-    g = MAFIA.get(peer_id-2000000000 if peer_id>=2000000000 else peer_id)
+    chat_id = peer_id - 2000000000 if peer_id >= 2000000000 else peer_id
+    g = MAFIA.get(chat_id)
     if not g or g['state']!='night': return
     if g['roles'].get(uid) != 'мафия': return send(peer_id, "❌ Только мафия")
     if target not in g['alive']: return
@@ -286,7 +291,8 @@ def mafia_next_day(peer_id, chat_id):
     killed = g['night'].get('kill')
     if killed and killed in g['alive']: g['alive'].remove(killed)
     g['state']='day'
-    txt = f"{header(f'ДЕНЬ {g['day']}')}\n\n"
+    day_num = g['day']
+    txt = header("ДЕНЬ " + str(day_num)) + "\n\n"
     if killed: txt += f"💀 Ночью погиб {mention(killed)}\n\n"
     txt += "Обсуждайте и голосуйте:\n/мафия_голос <id>\n\nЖивые:\n"
     for u in g['alive']: txt += f"  • {mention(u)}\n"
@@ -294,7 +300,8 @@ def mafia_next_day(peer_id, chat_id):
     g['votes'] = {}
 
 def mafia_vote(peer_id, uid, target):
-    g = MAFIA.get(peer_id-2000000000 if peer_id>=2000000000 else peer_id)
+    chat_id = peer_id - 2000000000 if peer_id >= 2000000000 else peer_id
+    g = MAFIA.get(chat_id)
     if not g or g['state']!='day': return
     if uid not in g['alive']: return
     if target not in g['alive']: return
@@ -320,7 +327,8 @@ def mafia_resolve(peer_id, chat_id):
         txt += "🔪 МАФИЯ ПОБЕДИЛА!"
         send(peer_id, txt); del MAFIA[chat_id]; return
     g['day'] += 1; g['state'] = 'night'; g['night'] = {}
-    txt += f"{header(f'НОЧЬ {g['day']}')}\n\nМафия выбирает жертву."
+    day_num = g['day']
+    txt += header("НОЧЬ " + str(day_num)) + "\n\nМафия выбирает жертву."
     send(peer_id, txt)
 
 # ============ ОСНОВНОЙ ОБРАБОТЧИК ============
@@ -329,6 +337,36 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     args = text.split(); cmd = args[0].lower() if args else ""
     chat_id = peer_to_chat(peer_id)
 
+    # ============ /stop ============
+    if cmd == "/stop":
+        if not is_owner(uid): return send(peer_id, "❌ Только главный владелец")
+        cur.execute("INSERT OR REPLACE INTO bot_disabled(peer_id,since) VALUES(?,?)", (peer_id, int(time.time())))
+        conn.commit()
+        send(peer_id, "🛑 Бот выключен в этом чате.\nДля включения: /start")
+        return
+
+    # ============ /start ============
+    if cmd == "/start":
+        if is_bot_disabled(peer_id):
+            if not is_owner(uid): return
+            cur.execute("DELETE FROM bot_disabled WHERE peer_id=?", (peer_id,))
+            conn.commit()
+            send(peer_id, "✅ Бот снова активен в этом чате!")
+            return
+        if is_owner(uid) and chat_id:
+            send(peer_id, "✅ Бот активен. Для выключения — /stop")
+            return
+        # обычное меню
+        get_user(uid); u = get_user(uid)
+        send(peer_id, f"{header('БОЕВОЙ БОТ')}\n\n  👤 {name_of(uid)}\n"
+                      f"  💰 {fmt(u[1])} 💵\n  🎖️ {u[10]}\n  🌍 {u[5] or 'нет гражданства'}\n\n"
+                      f"  🎯 Выберите действие\n  📖 /help — все команды", kb_main())
+        return
+
+    # Если бот выключен в этом чате — игнорируем всё
+    if is_bot_disabled(peer_id):
+        return
+
     if is_banned(uid) and not is_owner(uid):
         if chat_id: kick_user(chat_id, uid)
         return
@@ -336,8 +374,8 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if message_id: delete_message(peer_id, message_id)
         return
 
-    # ================= START =================
-    if low in ("начать","start","/start","меню","◀️ меню"):
+    # ================= МЕНЮ =================
+    if low in ("начать","start","меню","◀️ меню"):
         get_user(uid); u = get_user(uid)
         send(peer_id, f"{header('БОЕВОЙ БОТ')}\n\n  👤 {name_of(uid)}\n"
                       f"  💰 {fmt(u[1])} 💵\n  🎖️ {u[10]}\n  🌍 {u[5] or 'нет гражданства'}\n\n"
@@ -356,7 +394,8 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             f"🎭 /role /setrole /grole /staff /gstaff\n"
             f"👑 /nick /rnick /стата /cmd\n"
             f"🎟️ /promo /promolist\n"
-            f"🛡️ /warn /mute /kick /ban /обнулить /вайп", kb_back())
+            f"🛡️ /warn /mute /kick /ban /обнулить /вайп\n"
+            f"👑 /start /stop — вкл/выкл бота (владелец)", kb_back())
         return
 
     # ================= ЭКОНОМИКА =================
@@ -398,7 +437,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         u = get_user(uid)
         if u[14]:
             return send(peer_id, "✅ Подписка уже активна!")
-        send(peer_id, f"📰 Чтобы получить награду, подпишись на сообщество:\nhttps://vk.com/club{GROUP_ID}\n\nПосле подписки напиши /подписка ещё раз")
         try:
             r = vk.groups.isMember(group_id=GROUP_ID, user_id=uid)
             if r:
@@ -406,8 +444,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
                 upd_balance(uid, 50000); conn.commit()
                 send(peer_id, "🎉 Спасибо за подписку! +50 000 💵")
             else:
-                send(peer_id, "❌ Ты ещё не подписан!")
-        except: pass
+                send(peer_id, f"📰 Подпишись на сообщество:\nhttps://vk.com/club{GROUP_ID}\n\nЗатем напиши /подписка снова")
+        except:
+            send(peer_id, f"📰 Подпишись: https://vk.com/club{GROUP_ID}\nЗатем /подписка снова")
         return
 
     if cmd == "/buybiz":
@@ -525,7 +564,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     # ================= ИВЕНТ / МАФИЯ =================
     if cmd in ("/ивент","/мафия"):
         if not chat_id: return send(peer_id, "❌ Только в беседе")
-        if args[1:] and args[1].lower()=="стоп":
+        if len(args)>1 and args[1].lower()=="стоп":
             if chat_id in MAFIA: del MAFIA[chat_id]
             return send(peer_id, "🛑 Игра остановлена")
         mafia_new(peer_id, uid, chat_id); return
@@ -562,7 +601,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/newrole":
         if not is_owner(uid): return send(peer_id, "❌ Только владелец")
         if len(args)<3: return send(peer_id, "📝 /newrole <название> <уровень>")
-        name = args[1]; 
+        name = args[1]
         try: lvl = int(args[2])
         except: return send(peer_id, "❌ Уровень — число")
         cur.execute("INSERT OR REPLACE INTO roles(name,level,created_by,created_at) VALUES(?,?,?,?)",
@@ -572,7 +611,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/setrole":
         if not is_owner(uid) and not is_admin(uid): return send(peer_id, "❌")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
-        if not t or len(args)<3: return send(peer_id, "📝 /setrole <юзер> <роль> (или ответом)")
+        if not t or len(args)<3: return send(peer_id, "📝 /setrole <юзер> <роль>")
         role = args[2]
         cur.execute("SELECT name FROM roles WHERE name=?", (role,))
         if not cur.fetchone(): return send(peer_id, "❌ Роль не найдена")
@@ -592,7 +631,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     if cmd == "/staff":
         if not chat_id: return send(peer_id, "❌ Только в беседе")
-        cur.execute("""SELECT ur.user_id, ur.role FROM user_roles ur WHERE ur.chat_id=?""", (chat_id,))
+        cur.execute("SELECT user_id, role FROM user_roles WHERE chat_id=?", (chat_id,))
         rows = cur.fetchall()
         if not rows: return send(peer_id, "📋 Состав пуст")
         txt = header("СОСТАВ ЧАТА")+"\n\n"
@@ -612,7 +651,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     # ================= НИКИ =================
     if cmd == "/nick":
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
-        if t and (is_admin(uid) or is_owner(uid)):
+        if t and (is_admin(uid) or is_owner(uid)) and t != uid:
             if len(args)<3: return send(peer_id, "📝 /nick <юзер> <ник>")
             nick = " ".join(args[2:])
         else:
@@ -632,10 +671,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/стата":
         t = extract_uid(args[1] if len(args)>1 else None, event_msg) or uid
         u = get_user(t)
-        cur.execute("SELECT COUNT(*) FROM user_roles WHERE user_id=?", (t,)); rl = cur.fetchone()[0]
         cur.execute("SELECT COALESCE(gr.role, u.role) FROM users u LEFT JOIN global_roles gr ON gr.user_id=u.user_id WHERE u.user_id=?", (t,))
         rr = cur.fetchone(); role = rr[0] if rr else 'user'
-        send(peer_id, card(f"СТАТИСТИКА", [
+        send(peer_id, card("СТАТИСТИКА", [
             ("👤", name_of(t)), ("🆔", f"id{t}"),
             ("💰 Баланс", f"{fmt(u[1])} 💵"),
             ("🎖️ Звание", u[10]),
@@ -646,10 +684,10 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             ("📰 Подписка", "✅" if u[14] else "❌"),
         ]), kb_back()); return
 
-    # ================= CMD (команда только себе) =================
+    # ================= CMD =================
     if cmd == "/cmd":
         if not is_owner(uid): return send(peer_id, "❌ Только владелец")
-        if len(args)<2: return send(peer_id, "📝 /cmd <команда> — настроить доступ")
+        if len(args)<2: return send(peer_id, "📝 /cmd <команда>")
         c = args[1]
         cur.execute("INSERT OR IGNORE INTO cmd_perms(user_id,command) VALUES(?,?)", (uid, c)); conn.commit()
         send(peer_id, f"✅ Команда {c} разрешена только тебе"); return
@@ -1221,7 +1259,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for u,r in rows: txt += f"  🚫 id{u} — {r}\n"
         send(peer_id, txt + f"\n{DIV}"); return
 
-    if cmd in ("/clear","/tickets","/adt","/rnick"):
+    if cmd in ("/clear","/tickets","/adt"):
         if not is_admin(uid): return
         send(peer_id, f"🛡️ {cmd[1:].upper()}: ок"); return
 
@@ -1251,9 +1289,14 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
                        citizenship=NULL, army=0, war=0, mute_until=0, last_bonus=0,
                        rank='Новобранец', biz=0, biz_income=0, biz_collect=0, subscription=0
                        WHERE user_id=?""", (t,))
-        for tbl in ("user_roles","global_roles","companies","transports","members","nicks","cmd_perms","candidates"):
-            col = "user_id" if tbl != "companies" and tbl != "transports" else "owner"
-            cur.execute(f"DELETE FROM {tbl} WHERE {col}=?", (t,))
+        cur.execute("DELETE FROM user_roles WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM global_roles WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM companies WHERE owner=?", (t,))
+        cur.execute("DELETE FROM transports WHERE owner=?", (t,))
+        cur.execute("DELETE FROM members WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM nicks WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM cmd_perms WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM candidates WHERE user_id=?", (t,))
         cur.execute("DELETE FROM votes WHERE voter=?", (t,))
         conn.commit()
         send(peer_id, card("💀 ВАЙП", [("👤",name_of(t)),("💰 Было",f"{fmt(old_balance)} 💵"),
@@ -1269,7 +1312,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("DELETE FROM global_roles WHERE user_id=?",(t,))
         conn.commit(); send(peer_id,f"✅ {mention(t)} снят"); return
 
-    if cmd in ("/delrole","/setlog","/build_admin","/gstaff_admin"):
+    if cmd in ("/delrole","/setlog","/build_admin"):
         if not is_owner(uid): return
         send(peer_id, f"👑 {cmd[1:].upper()}: ок"); return
 
@@ -1310,7 +1353,6 @@ def main():
     while True:
         try:
             for event in longpoll.listen():
-                # --- Callback нажатие кнопки ---
                 if event.type == VkBotEventType.MESSAGE_EVENT:
                     try:
                         eid = event.object.event_id
