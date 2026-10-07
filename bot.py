@@ -104,8 +104,15 @@ def init_db():
         ("Хакер", 40000, 25, 1500),("Директор", 50000, 25, 2500),
     ]
     for j, s, e, me in jobs:
-        try: cur.execute("INSERT OR IGNORE INTO jobs(name,salary,exp,min_exp) VALUES(?,?,?,?)", (j,s,e,me))
-        except: pass
+        try:
+            cur.execute("SELECT name FROM jobs WHERE LOWER(name)=LOWER(?)", (j,))
+            if cur.fetchone():
+                cur.execute("UPDATE jobs SET salary=?, exp=?, min_exp=? WHERE LOWER(name)=LOWER(?)",
+                            (s, e, me, j))
+            else:
+                cur.execute("INSERT INTO jobs(name,salary,exp,min_exp) VALUES(?,?,?,?)", (j,s,e,me))
+        except Exception as ex:
+            print(f"Job insert {j}: {ex}")
 
     biz = [("Киоск", 50000, 2000),("Магазин", 100000, 5000),("Кафе", 200000, 10000),
            ("Ресторан", 350000, 18000),("Автомойка", 500000, 25000),("Отель", 700000, 35000),
@@ -592,6 +599,7 @@ HELP_OWNER = f"""{header('КОМАНДЫ ВЛАДЕЛЬЦА (80-101)')}
   /newrole <название> <приоритет>
   /delrole <название>
 
+🔐 /adminpa — список паролей
 📖 /ghelp — этот список
 { DIV }"""
 
@@ -634,17 +642,58 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     if cmd == "/adminpanel":
         if len(args) < 2:
-            u = get_user(uid)
-            if not u[20]: return send(peer_id, "❌ Нет пароля")
             return send(peer_id, "🔑 Введите: /adminpanel <пароль>")
         pw = args[1]
         u = get_user(uid)
-        if not u[20]: return send(peer_id, "❌ Нет пароля")
-        if u[20] != pw: return send(peer_id, "❌ Неверный пароль")
+        if not u[20]:
+            return send(peer_id, "❌ У вас нет пароля. Обратитесь к администрации.")
+        if u[20] != pw:
+            return send(peer_id, "❌ Неверный пароль")
+
         p = get_priority(uid)
-        if p >= 80: send(uid, HELP_OWNER)
-        elif p >= 4: send(uid, HELP_ADMIN)
-        else: send(uid, HELP_USER)
+        cur.execute("SELECT COUNT(*) FROM tickets WHERE answered_by=?", (uid,))
+        t_answered = cur.fetchone()[0] or 0
+        cur.execute("SELECT COUNT(*) FROM tickets WHERE answered_by=? AND status='closed'", (uid,))
+        t_closed = cur.fetchone()[0] or 0
+
+        if p >= 80:
+            cmds = HELP_OWNER; rank = "👑 Владелец"
+        elif p >= 40:
+            cmds = HELP_ADMIN; rank = "🛡 Админ"
+        elif p >= 10:
+            cmds = HELP_ADMIN; rank = "🔨 Модератор"
+        elif p >= 4:
+            cmds = HELP_ADMIN; rank = "🎯 Хелпер"
+        else:
+            return send(peer_id, "❌ У вас нет прав администратора")
+
+        stat = (f"{header('👑 АДМИН-ПАНЕЛЬ')}\n\n"
+                f"  👤 {name_of(uid)}\n"
+                f"  🆔 id{uid}\n"
+                f"  🎭 Ранг: {rank}\n"
+                f"  📊 Приоритет: {p}/101\n\n"
+                f"  📩 Тикетов принято: {t_closed}\n"
+                f"  📬 Всего обработано: {t_answered}\n\n"
+                f"  ⏰ {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+                f"{DIV}\n\n")
+        send(uid, stat + cmds)
+        send(peer_id, "✅ Панель отправлена в личку!")
+        return
+
+    if cmd == "/adminpa":
+        if uid != MAIN_OWNER:
+            return send(peer_id, "❌ Только для главного владельца")
+        cur.execute("""SELECT user_id, priority, password FROM users
+                       WHERE password IS NOT NULL AND priority >= 1
+                       ORDER BY priority DESC LIMIT 50""")
+        rows = cur.fetchall()
+        if not rows:
+            return send(peer_id, "❌ Пока нет игроков с паролями")
+        txt = header("🔐 СПИСОК АДМИНОВ")+f"\n\n  Всего: {len(rows)}\n\n"
+        for tu, prio, pw in rows:
+            txt += f"  🎭 {name_of(tu)}\n     🆔 id{tu}\n     📊 Приоритет: {prio}\n     🔑 Пароль: `{pw}`\n\n"
+        txt += f"{DIV}\n⚠️ Храните в тайне!"
+        send(peer_id, txt)
         return
 
     if is_banned(uid) and not is_owner(uid):
@@ -824,15 +873,22 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/устроиться":
         if len(args) < 2: return send(peer_id, "📝 /устроиться <название>")
         job = " ".join(args[1:])
-        cur.execute("SELECT name,salary,exp,min_exp FROM jobs WHERE name=?", (job,))
+        cur.execute("SELECT name,salary,exp,min_exp FROM jobs WHERE LOWER(name)=LOWER(?)", (job,))
         j = cur.fetchone()
-        if not j: return send(peer_id, "❌ Работа не найдена. /работы")
+        if not j:
+            cur.execute("SELECT name FROM jobs ORDER BY min_exp")
+            all_jobs = [r[0] for r in cur.fetchall()]
+            if not all_jobs:
+                return send(peer_id, "❌ Таблица работ пуста. Обратитесь к админу.")
+            return send(peer_id, f"❌ Работа «{job}» не найдена.\n\n📋 Доступные:\n" +
+                        "\n".join(f"  • {n}" for n in all_jobs))
+        job_real = j[0]
         u = get_user(uid)
         if u[15] < j[3]:
-            return send(peer_id, f"❌ Недостаточно опыта!\nНужно: {j[3]} exp\nУ вас: {u[15]} exp")
-        cur.execute("UPDATE users SET work=?, work_last=0 WHERE user_id=?", (job, uid)); conn.commit()
+            return send(peer_id, f"❌ Недостаточно опыта!\nНужно: {j[3]} exp\nУ вас: {u[15]} exp\n\nНабирай exp общением и работой!")
+        cur.execute("UPDATE users SET work=?, work_last=0 WHERE user_id=?", (job_real, uid)); conn.commit()
         send(peer_id, card("💼 УСТРОЙСТВО", [
-            ("👤",name_of(uid)),("💼",job),("💰",f"{fmt(j[1])} 💵"),("⚡",f"+{j[2]} exp"),
+            ("👤",name_of(uid)),("💼",job_real),("💰",f"{fmt(j[1])} 💵"),("⚡",f"+{j[2]} exp"),
         ], "/работать")); return
 
     if cmd == "/уволиться":
@@ -869,7 +925,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/купбиз":
         if len(args) < 2: return send(peer_id, "📝 /купбиз <название>")
         name = " ".join(args[1:])
-        cur.execute("SELECT name,price,income FROM biz_types WHERE name=?", (name,))
+        cur.execute("SELECT name,price,income FROM biz_types WHERE LOWER(name)=LOWER(?)", (name,))
         b = cur.fetchone()
         if not b: return send(peer_id, "❌ Не найден. /списокбиз")
         if get_balance(uid) < b[1]: return send(peer_id, f"❌ Нужно {fmt(b[1])} 💵")
@@ -883,7 +939,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/собрать":
         if len(args) < 2: return send(peer_id, "📝 /собрать <название>")
         name = " ".join(args[1:])
-        cur.execute("SELECT id,income FROM companies WHERE owner=? AND name=?", (uid, name))
+        cur.execute("SELECT id,income FROM companies WHERE owner=? AND LOWER(name)=LOWER(?)", (uid, name))
         rows = cur.fetchall()
         if not rows: return send(peer_id, "❌ Нет такого бизнеса")
         total = sum(r[1] for r in rows)
@@ -1863,6 +1919,10 @@ def main():
                 cur.execute("UPDATE users SET role='Гл.Владелец', priority=101, balance=MAX(balance,999999999) WHERE user_id=?", (ow,))
             except: pass
         conn.commit()
+        # Проверка работ
+        cur.execute("SELECT COUNT(*) FROM jobs")
+        jc = cur.fetchone()[0]
+        print(f"💼 Работ в базе: {jc}")
     except Exception as e: print(f"Owner init: {e}")
 
     while True:
