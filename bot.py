@@ -155,6 +155,17 @@ def get_user(uid):
         cur.execute("SELECT * FROM users WHERE user_id=?", (uid,)); r = cur.fetchone()
     return r
 
+def get_password(uid):
+    get_user(uid)
+    cur.execute("SELECT password FROM users WHERE user_id=?", (uid,))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+def set_password(uid, pw):
+    get_user(uid)
+    cur.execute("UPDATE users SET password=? WHERE user_id=?", (pw, uid))
+    conn.commit()
+
 def upd_balance(uid, amount):
     get_user(uid); cur.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, uid)); conn.commit()
 
@@ -306,6 +317,9 @@ vk = vk_session.get_api()
 longpoll = VkBotLongPoll(vk_session, GROUP_ID)
 
 def send(peer_id, text, keyboard=None):
+    # В беседах клавиатуру не отправляем — только в личке
+    if peer_id >= 2000000000:
+        keyboard = None
     try: vk.messages.send(peer_id=peer_id, message=text, random_id=get_random_id(), keyboard=keyboard)
     except Exception as e: print(f"Send: {e}")
 
@@ -499,7 +513,7 @@ HELP_USER = f"""{header('КОМАНДЫ УЧАСТНИКА (0-3)')}
   /меню /паспорт /стата /уровень
   /баланс /топ /приз /ник <ник>
 
-🎲 ИГРЫ
+🎲 ИГРЫ (только в личке бота!)
   /казино /монетка /кубик /слоты
   /рулетка /дартс /краш /блэкджек
   /мины /кейс /дуэль /клуб
@@ -636,18 +650,19 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if is_bot_disabled(peer_id): return
 
     if cmd in ("/pass","/пароль"):
-        u = get_user(uid)
-        if u[20]: return send(peer_id, f"🔑 Ваш пароль: `{u[20]}`\n\nВведите: /adminpanel {u[20]}")
-        return send(peer_id, "❌ У вас нет пароля.")
+        pw = get_password(uid)
+        if pw:
+            return send(peer_id, f"🔑 Ваш пароль: `{pw}`\n\nВведите: /adminpanel {pw}")
+        return send(peer_id, "❌ У вас нет пароля. Обратитесь к администрации.")
 
     if cmd == "/adminpanel":
         if len(args) < 2:
             return send(peer_id, "🔑 Введите: /adminpanel <пароль>")
         pw = args[1]
-        u = get_user(uid)
-        if not u[20]:
+        pw_db = get_password(uid)
+        if not pw_db:
             return send(peer_id, "❌ У вас нет пароля. Обратитесь к администрации.")
-        if u[20] != pw:
+        if pw_db != pw:
             return send(peer_id, "❌ Неверный пароль")
 
         p = get_priority(uid)
@@ -1633,6 +1648,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if len(args) < 3: return send(peer_id, "📝 /setrole <юзер> <приоритет 0-100>")
         t = extract_uid(args[1], event_msg)
         if not t: return
+        get_user(t)
         try: prio = max(0, min(100, int(args[2])))
         except: return send(peer_id, "❌ Приоритет — число от 0 до 100")
         cur.execute("SELECT name FROM roles WHERE priority=?", (prio,))
@@ -1642,7 +1658,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             cur.execute("INSERT OR REPLACE INTO user_roles(user_id,chat_id,role) VALUES(?,?,?)", (t, chat_id, role_name))
         cur.execute("UPDATE users SET role=?, priority=? WHERE user_id=?", (role_name, prio, t))
         pw = gen_password()
-        cur.execute("UPDATE users SET password=? WHERE user_id=?", (pw, t)); conn.commit()
+        set_password(t, pw)
         send(peer_id, f"✅ {mention(t)} → {role_name} (приоритет {prio})")
         send_uid(t, f"🎭 Вам выдан приоритет: *{prio}* ({role_name})\n\n🔐 Пароль: `{pw}`\n\n/adminpanel {pw}")
         return
@@ -1652,6 +1668,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if len(args) < 3: return send(peer_id, "📝 /grole <юзер> <приоритет 0-100>")
         t = extract_uid(args[1], event_msg)
         if not t: return
+        get_user(t)
         try: prio = max(0, min(100, int(args[2])))
         except: return
         cur.execute("SELECT name FROM roles WHERE priority=?", (prio,))
@@ -1660,7 +1677,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("INSERT OR REPLACE INTO global_roles(user_id,role) VALUES(?,?)", (t, role_name))
         cur.execute("UPDATE users SET role=?, priority=? WHERE user_id=?", (role_name, prio, t))
         pw = gen_password()
-        cur.execute("UPDATE users SET password=? WHERE user_id=?", (pw, t)); conn.commit()
+        set_password(t, pw)
         send(peer_id, f"🌐 {mention(t)} → {role_name} ({prio})")
         send_uid(t, f"🌐 Глобальный приоритет: *{prio}*\n\n🔐 Пароль: `{pw}`\n\n/adminpanel {pw}")
         return
@@ -1670,9 +1687,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t: return
         pw = gen_password()
-        cur.execute("UPDATE users SET password=? WHERE user_id=?", (pw, t)); conn.commit()
-        send(peer_id, f"🔐 Новый пароль отправлен")
-        send_uid(t, f"🔐 Пароль: `{pw}`\n\n/adminpanel {pw}")
+        set_password(t, pw)
+        send(peer_id, f"🔐 Новый пароль отправлен {mention(t)}")
+        send_uid(t, f"🔐 Ваш новый пароль: `{pw}`\n\nВведите: /adminpanel {pw}")
         return
 
     if cmd == "/staff":
@@ -1782,7 +1799,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not t: return
         get_user(t)
         cur.execute("""UPDATE users SET balance=0, army=0, war=0, biz=0,
-                       biz_income=0, biz_collect=0, warns=0, mute_until=0 WHERE user_id=?""", (t,))
+                       biz_income=0, biz_collect=0, warns=0, mute_until=0, password=NULL WHERE user_id=?""", (t,))
         cur.execute("DELETE FROM user_roles WHERE user_id=?", (t,))
         cur.execute("DELETE FROM global_roles WHERE user_id=?", (t,))
         cur.execute("DELETE FROM companies WHERE owner=?", (t,))
@@ -1919,10 +1936,8 @@ def main():
                 cur.execute("UPDATE users SET role='Гл.Владелец', priority=101, balance=MAX(balance,999999999) WHERE user_id=?", (ow,))
             except: pass
         conn.commit()
-        # Проверка работ
         cur.execute("SELECT COUNT(*) FROM jobs")
-        jc = cur.fetchone()[0]
-        print(f"💼 Работ в базе: {jc}")
+        print(f"💼 Работ в базе: {cur.fetchone()[0]}")
     except Exception as e: print(f"Owner init: {e}")
 
     while True:
@@ -1934,11 +1949,25 @@ def main():
                         ev_uid = event.object.user_id
                         ev_peer = event.object.peer_id
                         payload = event.object.payload
-                        vk.messages.sendMessageEventAnswer(
-                            event_id=eid, user_id=ev_uid, peer_id=ev_peer,
-                            event_data=json.dumps({"type":"show_snackbar","text":"OK"}))
-                        if isinstance(payload, dict) and payload.get("cmd"):
-                            handle_message(ev_peer, ev_uid, payload["cmd"])
+
+                        is_dm = ev_peer < 2000000000  # личка
+
+                        if is_dm:
+                            vk.messages.sendMessageEventAnswer(
+                                event_id=eid, user_id=ev_uid, peer_id=ev_peer,
+                                event_data=json.dumps({"type":"show_snackbar","text":"OK"}))
+                            if isinstance(payload, dict) and payload.get("cmd"):
+                                handle_message(ev_peer, ev_uid, payload["cmd"])
+                        else:
+                            vk.messages.sendMessageEventAnswer(
+                                event_id=eid, user_id=ev_uid, peer_id=ev_peer,
+                                event_data=json.dumps({
+                                    "type": "show_snackbar",
+                                    "text": "❗ Кнопки работают только в личке бота"
+                                }))
+                            send(ev_peer,
+                                f"❗ {mention(ev_uid)}, кнопки работают только в **личке бота** @monster_managers.\n\n"
+                                f"📩 Напиши боту в личку и нажми /меню")
                     except Exception as e: print(f"MEv: {e}")
                     continue
                 if event.type != VkBotEventType.MESSAGE_NEW: continue
