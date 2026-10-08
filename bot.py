@@ -19,7 +19,6 @@ if not TOKEN:
     log("❌ НЕ ЗАДАН VK_TOKEN! Проверь переменные в Bothost.")
     raise SystemExit(1)
 
-log(f"🔧 TOKEN: {TOKEN[:25]}...")
 log(f"🔧 GROUP_ID: {GROUP_ID}")
 log(f"🔧 MAIN_OWNER: {MAIN_OWNER}")
 
@@ -384,7 +383,6 @@ try:
         log(f"✅ Группа найдена: {info[0]['name']} (id{info[0]['id']})")
     except Exception as e:
         log(f"❌ Не могу получить группу: {type(e).__name__}: {e}")
-        log("❗ Проверь: GROUP_ID правильный? Токен от этой группы?")
         traceback.print_exc(file=sys.stdout)
         raise SystemExit(1)
 
@@ -393,9 +391,43 @@ try:
     log("✅ Long Poll готов")
 except Exception as e:
     log(f"❌ Ошибка инициализации VK: {type(e).__name__}: {e}")
-    log("❗ Включён ли Long Poll API в группе? Включены ли 'Входящие сообщения'?")
     traceback.print_exc(file=sys.stdout)
     raise SystemExit(1)
+
+
+def send(peer_id, text, keyboard=None):
+    if peer_id >= 2000000000:
+        keyboard = None
+    try:
+        vk.messages.send(peer_id=peer_id, message=text, random_id=get_random_id(), keyboard=keyboard)
+    except Exception as e:
+        log(f"❌ Send error: {type(e).__name__}: {e}")
+
+
+def send_uid(user_id, text, keyboard=None):
+    try:
+        vk.messages.send(user_id=user_id, message=text, random_id=get_random_id(), keyboard=keyboard)
+    except Exception as e:
+        log(f"❌ SendUID error: {type(e).__name__}: {e}")
+
+
+def delete_message(peer_id, mid):
+    try:
+        vk.messages.delete(message_ids=mid, delete_for_all=1)
+        return True
+    except Exception as e:
+        log(f"❌ Delete error: {type(e).__name__}: {e}")
+        return False
+
+
+def kick_user(chat_id, user_id):
+    try:
+        vk.messages.removeChatUser(chat_id=chat_id, user_id=user_id)
+        return True
+    except Exception as e:
+        log(f"❌ Kick error: {type(e).__name__}: {e}")
+        return False
+
 
 # ============ КЛАВИАТУРЫ ============
 DIV = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
@@ -694,7 +726,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💸 Потеря:  -{fmt(bet)} 💵\n  💳 Баланс:  {fmt(nb)} 💵\n\n🍀 Не клюёт!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # Остальные 50/50
     win_flag = random.random() < 0.5
     base_win = bet if win_flag else -bet
     win = int(base_win * bonus) if base_win > 0 and bonus > 1.0 else base_win
@@ -2236,8 +2267,8 @@ def main():
                         else:
                             vk.messages.sendMessageEventAnswer(
                                 event_id=eid, user_id=ev_uid, peer_id=ev_peer,
-                                event_data=json.dumps({"type":"show_snackbar","text":"❗ Кнопки работают только в личке"}))
-                            send(ev_peer, f"❗ {mention(ev_uid)}, кнопки работают только в **личке бота**.\n\n📩 Напиши боту в личку и нажми /меню")
+                                event_data=json.dumps({"type":"show_snackbar","text":"❗ Кнопки только в личке"}))
+                            send(ev_peer, f"❗ {mention(ev_uid)}, кнопки работают только в **личке бота**.")
                     except Exception as e: log(f"MEv: {e}")
                     continue
                 if event.type != VkBotEventType.MESSAGE_NEW: continue
@@ -2251,12 +2282,13 @@ def main():
                         if member and member > 0: handle_chat_invite(peer_id, member)
                     continue
                 if not text: continue
-                try: handle_message(peer_id, uid, text, message_id, msg)
+                try:
+                    handle_message(peer_id, uid, text, message_id, msg)
                 except Exception as e:
-                    log(f"Handler: {e}")
+                    log(f"❌ Handler error: {e}")
                     traceback.print_exc(file=sys.stdout)
         except Exception as e:
-            log(f"LongPoll: {e}")
+            log(f"❌ LongPoll error: {type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stdout)
             time.sleep(3)
 
