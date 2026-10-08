@@ -1810,4 +1810,456 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, card("🎟️ ПРОМОКОД", [("🔑",code),("💰",f"{fmt(amount)} 💵"),("👥",str(uses))])); return
 
     if cmd == "/promolist":
-        cur.execute("SELECT code,amount,uses,max_uses FROM promos"); rows=cur.fetchall
+        cur.execute("SELECT code,amount,uses,max_uses FROM promos"); rows=cur.fetchall()
+        if not rows: return send(peer_id, "Нет промо")
+        txt = header("ПРОМО")+"\n\n"
+        for c,a,u,m in rows: txt += f"  🎟️ {c} — {fmt(a)} 💵 ({u}/{m})\n"
+        send(peer_id, txt + f"\n{DIV}"); return
+
+    # МОДЕРАЦИЯ
+    if cmd == "/warn":
+        if not is_admin(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        get_user(t); cur.execute("UPDATE users SET warns=warns+1 WHERE user_id=?", (t,)); conn.commit()
+        cur.execute("SELECT warns FROM users WHERE user_id=?", (t,)); w=cur.fetchone()[0]
+        if w>=3:
+            cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t,"3 варна")); conn.commit()
+            if chat_id: kick_user(chat_id, t)
+            send(peer_id, f"🚫 {mention(t)} автобан")
+        else: send(peer_id, f"⚠️ Варн {w}/3 для {mention(t)}")
+        return
+
+    if cmd == "/unwarn":
+        if not is_admin(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        cur.execute("UPDATE users SET warns=MAX(0,warns-1) WHERE user_id=?", (t,)); conn.commit()
+        send(peer_id, f"✅ Снят с {mention(t)}"); return
+
+    if cmd == "/mute":
+        if not is_admin(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        try: m = int(args[2]) if len(args)>2 else 60
+        except: m = 60
+        if is_owner(t) or is_admin(t): return
+        cur.execute("UPDATE users SET mute_until=? WHERE user_id=?", (int(time.time())+m*60,t)); conn.commit()
+        send(peer_id, f"🔇 {mention(t)} — {m}м"); return
+
+    if cmd == "/unmute":
+        if not is_admin(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        cur.execute("UPDATE users SET mute_until=0 WHERE user_id=?", (t,)); conn.commit()
+        send(peer_id, f"🔊 {mention(t)}"); return
+
+    if cmd == "/kick":
+        if not is_admin(uid): return
+        if not chat_id: return send(peer_id, "❌ Только в беседе")
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t or is_owner(t) or is_admin(t): return
+        kick_user(chat_id, t); send(peer_id, f"👢 {mention(t)}"); return
+
+    if cmd == "/ban":
+        if not is_admin(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t or is_owner(t) or is_admin(t): return
+        reason = " ".join(args[2:]) if len(args)>2 else "не указана"
+        cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t,reason)); conn.commit()
+        if chat_id: kick_user(chat_id, t)
+        send(peer_id, f"🚫 {mention(t)}: {reason}"); return
+
+    if cmd == "/unban":
+        if not is_admin(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        cur.execute("DELETE FROM bans WHERE user_id=?", (t,)); conn.commit()
+        send(peer_id, f"✅ {mention(t)}"); return
+
+    if cmd == "/gban":
+        if not is_owner(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t,"GBAN")); conn.commit()
+        if chat_id: kick_user(chat_id, t)
+        send(peer_id, f"🚫 GBAN id{t}"); return
+
+    if cmd == "/banlist":
+        cur.execute("SELECT user_id,reason FROM bans"); rows=cur.fetchall()
+        if not rows: return send(peer_id, "Пусто")
+        txt = header("БАНЛИСТ")+"\n\n"
+        for u,r in rows: txt += f"  🚫 id{u} — {r}\n"
+        send(peer_id, txt + f"\n{DIV}"); return
+
+    # РОЛИ
+    if cmd == "/role":
+        cur.execute("SELECT name,priority,emoji FROM roles ORDER BY priority DESC"); rows = cur.fetchall()
+        txt = header("РОЛИ")+"\n\n"
+        for n,p,e in rows: txt += f"  {e} {n} — приоритет {p}\n"
+        send(peer_id, txt + f"\n{DIV}"); return
+
+    if cmd == "/newrole":
+        if not is_owner(uid): return
+        if len(args) < 3: return send(peer_id, "📝 /newrole <название роли> <приоритет> [эмодзи]")
+        last = args[-1]
+        has_emoji = any(ord(c) > 0x2600 for c in last) and len(last) < 6
+        if has_emoji:
+            emoji = last
+            try: prio = max(0, min(100, int(args[-2])))
+            except: return send(peer_id, "❌ Приоритет — число 0-100")
+            name = " ".join(args[1:-2])
+        else:
+            emoji = "🎭"
+            try: prio = max(0, min(100, int(args[-1])))
+            except: return send(peer_id, "❌ Приоритет — число 0-100")
+            name = " ".join(args[1:-1])
+        if not name: return send(peer_id, "❌ Укажи название роли")
+        cur.execute("INSERT OR REPLACE INTO roles(name,priority,emoji,created_by,created_at) VALUES(?,?,?,?,?)",
+                    (name, prio, emoji, uid, int(time.time()))); conn.commit()
+        send(peer_id, card("✅ РОЛЬ СОЗДАНА", [("🎭 Название", name),("🎚 Приоритет", str(prio)),("😀 Эмодзи", emoji)],
+            "Используй: /setrole @юзер " + str(prio))); return
+
+    if cmd == "/delrole":
+        if not is_owner(uid): return
+        if len(args)<2: return send(peer_id, "📝 /delrole <название>")
+        cur.execute("DELETE FROM roles WHERE name=?", (args[1],)); conn.commit()
+        send(peer_id, f"🗑 Роль «{args[1]}» удалена"); return
+
+    if cmd == "/setrole":
+        if not is_owner(uid) and not is_admin(uid): return
+        if len(args) < 3: return send(peer_id, "📝 /setrole <юзер> <приоритет 0-100>")
+        t = extract_uid(args[1], event_msg)
+        if not t: return
+        get_user(t)
+        try: prio = max(0, min(100, int(args[2])))
+        except: return send(peer_id, "❌ Приоритет — число 0-100")
+        cur.execute("SELECT name,emoji FROM roles WHERE priority=?", (prio,)); rr = cur.fetchone()
+        role_name = rr[0] if rr else f"Приоритет {prio}"
+        if chat_id:
+            cur.execute("INSERT OR REPLACE INTO user_roles(user_id,chat_id,role) VALUES(?,?,?)", (t, chat_id, role_name))
+        cur.execute("UPDATE users SET role=?, priority=? WHERE user_id=?", (role_name, prio, t))
+        pw = gen_password(); set_password(t, pw)
+        send(peer_id, f"✅ {mention(t)} → {role_name} ({prio})")
+        send_uid(t, f"🎭 Вам выдан приоритет: *{prio}* ({role_name})\n\n🔐 Пароль: `{pw}`\n\n/adminpanel {pw}")
+        return
+
+    if cmd == "/grole":
+        if not is_owner(uid): return
+        if len(args) < 3: return send(peer_id, "📝 /grole <юзер> <приоритет 0-100>")
+        t = extract_uid(args[1], event_msg)
+        if not t: return
+        get_user(t)
+        try: prio = max(0, min(100, int(args[2])))
+        except: return
+        cur.execute("SELECT name FROM roles WHERE priority=?", (prio,)); rr = cur.fetchone()
+        role_name = rr[0] if rr else f"Приоритет {prio}"
+        cur.execute("INSERT OR REPLACE INTO global_roles(user_id,role) VALUES(?,?)", (t, role_name))
+        cur.execute("UPDATE users SET role=?, priority=? WHERE user_id=?", (role_name, prio, t))
+        pw = gen_password(); set_password(t, pw)
+        send(peer_id, f"🌐 {mention(t)} → {role_name} ({prio})")
+        send_uid(t, f"🌐 Глобально: *{prio}*\n\n🔐 Пароль: `{pw}`\n\n/adminpanel {pw}")
+        return
+
+    if cmd == "/setpass":
+        if not is_owner(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        pw = gen_password(); set_password(t, pw)
+        send(peer_id, f"🔐 Пароль отправлен {mention(t)}")
+        send_uid(t, f"🔐 Новый пароль: `{pw}`\n\n/adminpanel {pw}")
+        return
+
+    if cmd == "/staff":
+        if not chat_id: return send(peer_id, "❌ Только в беседе")
+        cur.execute("SELECT user_id, role FROM user_roles WHERE chat_id=?", (chat_id,)); rows = cur.fetchall()
+        txt = header("👥 СОСТАВ ЧАТА")+"\n\n"
+        if not rows: txt += "  ❌ Нет ролей\n"
+        else:
+            for u,r in rows: txt += f"  🎭 {r} → {mention(u)}\n"
+        send(peer_id, txt + f"\n{DIV}"); return
+
+    if cmd == "/gstaff":
+        cur.execute("""SELECT u.user_id, COALESCE(gr.role, u.role) FROM users u
+                       LEFT JOIN global_roles gr ON gr.user_id=u.user_id
+                       WHERE u.priority >= 4 OR gr.role IS NOT NULL""")
+        rows = cur.fetchall()
+        txt = header("🌐 СОСТАВ")+"\n\n"
+        if not rows: txt += "  ❌ Нет\n"
+        else:
+            for u,r in rows: txt += f"  🌐 {r} → {mention(u)}\n"
+        send(peer_id, txt + f"\n{DIV}"); return
+
+    if cmd == "/nick":
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if t and (is_admin(uid) or is_owner(uid)) and t != uid:
+            if len(args)<3: return
+            nick = " ".join(args[2:])
+        else:
+            t = uid; nick = " ".join(args[1:])
+            if not nick: return send(peer_id, "📝 /nick <ник>")
+        cur.execute("INSERT OR REPLACE INTO nicks(user_id,nick) VALUES(?,?)", (t, nick)); conn.commit()
+        send(peer_id, f"✅ Ник {mention(t)}: {nick}"); return
+
+    if cmd == "/rnick":
+        if not is_admin(uid) and not is_owner(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        cur.execute("DELETE FROM nicks WHERE user_id=?", (t,)); conn.commit()
+        send(peer_id, f"✅ Ник снят"); return
+
+    if cmd == "/стата" or cmd == "📊 стата":
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg) or uid
+        u = get_user(t); prio = get_priority(t)
+        cur.execute("SELECT title FROM users WHERE user_id=?", (t,)); r = cur.fetchone()
+        custom = r[0] if r and r[0] else "—"
+        bonus, _ = get_title_bonus(t)
+        send(peer_id, card("СТАТИСТИКА", [
+            ("👤",name_of(t)),("🆔",f"id{t}"),("🎭",f"Приоритет {prio}"),
+            ("⭐ Титул",custom),("🎰 Бонус игр",f"×{bonus}"),
+            ("🏆",f"{u[16]} {get_title(u[16])}"),("⚡",f"{u[15]} exp"),
+            ("💰",f"{fmt(u[1])} 💵"),("🌍",u[5] or "нет"),("💼",u[17] or "нет"),
+        ]), kb_back()); return
+
+    if cmd == "/cmd":
+        if not is_owner(uid): return
+        if len(args)<2: return
+        cur.execute("INSERT OR IGNORE INTO cmd_perms(user_id,command) VALUES(?,?)", (uid, args[1])); conn.commit()
+        send(peer_id, f"✅ {args[1]} только для тебя"); return
+
+    if cmd == "/объявление":
+        if not is_owner(uid): return
+        if len(args)<2: return
+        text_msg = " ".join(args[1:])
+        cur.execute("SELECT peer_id FROM builds"); rows = cur.fetchall()
+        sent = 0
+        for (p,) in rows:
+            try:
+                vk.messages.send(peer_id=p, message=f"{header('ОБЪЯВЛЕНИЕ')}\n\n{text_msg}\n{DIV}", random_id=get_random_id())
+                sent += 1
+            except: pass
+        send(peer_id, f"📢 Отправлено в {sent} бесед"); return
+
+    if cmd == "/builds":
+        if not is_owner(uid): return
+        if not chat_id: return
+        title = " ".join(args[1:]) if len(args)>1 else f"Беседа {chat_id}"
+        cur.execute("INSERT OR REPLACE INTO builds(chat_id,peer_id,title,linked_by,linked_at) VALUES(?,?,?,?,?)",
+                    (chat_id,peer_id,title,uid,int(time.time()))); conn.commit()
+        send(peer_id, f"✅ Привязано: {title}"); return
+
+    if cmd == "/build":
+        if not is_owner(uid): return
+        cur.execute("SELECT chat_id,title FROM builds"); rows=cur.fetchall()
+        if not rows: return send(peer_id, "📋 Нет")
+        txt = header("ПРИВЯЗАННЫЕ")+"\n\n"
+        for c,t in rows: txt += f"  🏛 {t} (id {c})\n"
+        send(peer_id, txt + f"\n{DIV}"); return
+
+    if cmd == "/removestaff":
+        if not is_owner(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        cur.execute("UPDATE users SET role='user', priority=0, password=NULL, title=NULL WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM global_roles WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM user_roles WHERE user_id=?", (t,))
+        conn.commit(); send(peer_id, f"✅ {mention(t)} снят"); return
+
+    if cmd == "/обнулить":
+        if not is_owner(uid) and not is_admin(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        get_user(t)
+        cur.execute("""UPDATE users SET balance=0, army=0, war=0, biz=0,
+                       biz_income=0, biz_collect=0, warns=0, mute_until=0 WHERE user_id=?""", (t,))
+        cur.execute("DELETE FROM user_roles WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM global_roles WHERE user_id=?", (t,))
+        cur.execute("DELETE FROM companies WHERE owner=?", (t,))
+        cur.execute("DELETE FROM transports WHERE owner=?", (t,))
+        conn.commit(); send(peer_id, f"♻️ {mention(t)} обнулён"); return
+
+    if cmd == "/вайп":
+        if not is_owner(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t: return
+        if t in OWNERS: return send(peer_id, "❌ Нельзя")
+        get_user(t); old_bal = get_balance(t)
+        cur.execute("""UPDATE users SET balance=0, warns=0, role='user', country=NULL,
+                       citizenship=NULL, army=0, war=0, mute_until=0, last_bonus=0,
+                       rank='Новобранец', biz=0, biz_income=0, biz_collect=0, subscription=0,
+                       priority=0, exp=0, level=0, work=NULL, password=NULL, title=NULL
+                       WHERE user_id=?""", (t,))
+        for q in ["DELETE FROM user_roles WHERE user_id=?","DELETE FROM global_roles WHERE user_id=?",
+                  "DELETE FROM companies WHERE owner=?","DELETE FROM transports WHERE owner=?",
+                  "DELETE FROM members WHERE user_id=?","DELETE FROM nicks WHERE user_id=?",
+                  "DELETE FROM cmd_perms WHERE user_id=?","DELETE FROM candidates WHERE user_id=?",
+                  "DELETE FROM votes WHERE voter=?"]:
+            cur.execute(q, (t,))
+        conn.commit()
+        send(peer_id, f"💀 ВАЙП {mention(t)}\nБыло: {fmt(old_bal)} 💵"); return
+
+    if cmd == "/выдать":
+        if not is_owner(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t or len(args)<3: return
+        try: a = int(args[2])
+        except: return
+        upd_balance(t, a); send(peer_id, f"✅ +{fmt(a)} 💵 → {mention(t)}"); return
+
+    if cmd == "/вернуть":
+        if not is_owner(uid): return
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if not t or len(args)<3: return
+        try: a = int(args[2])
+        except: return
+        upd_balance(t, -a); send(peer_id, f"✅ -{fmt(a)} 💵"); return
+
+    if cmd in ("/ивент","/мафия"):
+        if not chat_id: return send(peer_id, "❌ Только в беседе")
+        if len(args)>1 and args[1].lower()=="стоп":
+            if chat_id in MAFIA: del MAFIA[chat_id]
+            return send(peer_id, "🛑 Стоп")
+        mafia_new(peer_id, uid, chat_id); return
+    if cmd == "/мафия_вступить":
+        if chat_id: mafia_join(peer_id, uid, chat_id); return
+    if cmd == "/мафия_старт":
+        if chat_id: mafia_start(peer_id, uid, chat_id); return
+    if cmd == "/мафия_убить":
+        if len(args)<2: return
+        try: t = int(args[1])
+        except: return
+        mafia_kill(peer_id, uid, t); return
+    if cmd == "/мафия_голос":
+        if len(args)<2: return
+        try: t = int(args[1])
+        except: return
+        mafia_vote(peer_id, uid, t); return
+    if cmd == "/мафия_итог":
+        if chat_id: mafia_resolve(peer_id, chat_id); return
+
+    if cmd in ("/дуэль","⚔️ дуэль"):
+        if len(args)<3: return
+        try:
+            t=int(args[1].replace("@","").split("|")[0].split("]")[0]); bet=int(args[2])
+        except: return
+        if t==uid or get_balance(uid)<bet or get_balance(t)<bet: return
+        if random.random()<0.5:
+            upd_balance(uid,bet); upd_balance(t,-bet); send(peer_id, f"⚔️ {mention(uid)} победил! +{fmt(bet)} 💵")
+        else:
+            upd_balance(uid,-bet); upd_balance(t,bet); send(peer_id, f"⚔️ {mention(t)} победил!")
+        return
+
+    if cmd in ("/клуб","🎰 клуб"):
+        send(peer_id, card("🎰 КЛУБ",[("🎲","/казино"),("🪙","/монетка"),("🍒","/слоты"),
+            ("🎡","/рулетка"),("🎯","/дартс"),("🚀","/краш")]), kb_games()); return
+
+    if cmd == "/купитьклуб":
+        if get_balance(uid)<1000000: return
+        upd_balance(uid,-1000000); send(peer_id, "💎 Клуб куплен!"); return
+
+    if cmd == "/раздача":
+        if not is_admin(uid): return
+        if len(args) < 4: return send(peer_id, "📝 /раздача <сумма> <s|m|h|d> <текст>")
+        try: a = int(args[1]); unit = args[2].lower()
+        except: return
+        mult = {"s":1,"m":60,"h":3600,"d":86400}.get(unit,60)
+        cur.execute("INSERT INTO giveaways(amount,expire,text,creator) VALUES(?,?,?,?)",
+                    (a, int(time.time())+mult, " ".join(args[3:]), uid)); conn.commit()
+        send(peer_id, f"🎁 Раздача #{cur.lastrowid} на {fmt(a)} 💵"); return
+
+    if cmd == "/взять":
+        cur.execute("SELECT id,amount FROM giveaways WHERE taken_by IS NULL AND expire>? ORDER BY id DESC LIMIT 1", (int(time.time()),))
+        g = cur.fetchone()
+        if not g: return send(peer_id, "❌ Нет")
+        cur.execute("UPDATE giveaways SET taken_by=? WHERE id=?", (uid, g[0])); conn.commit()
+        upd_balance(uid, g[1]); send(peer_id, f"🎉 +{fmt(g[1])} 💵"); return
+
+    if cmd == "/задания":
+        send(peer_id, card("📋 ЗАДАНИЯ", [("1️⃣","5 новобранцев → 50 000"),
+            ("2️⃣","3 дуэли → 30 000"),("3️⃣","Захват → 500 000")])); return
+
+    if text.startswith("/"):
+        send(peer_id, f"❓ {cmd} не найдена. /help")
+
+
+def biz_page(peer_id, page):
+    if page < 0: page = 0
+    cur.execute("SELECT name,price,income FROM biz_types ORDER BY price LIMIT 10 OFFSET ?", (page*10,))
+    rows = cur.fetchall()
+    if not rows: return send(peer_id, "❌ Больше нет бизнесов", kb_back())
+    txt = header(f"🏢 БИЗНЕСЫ (стр. {page+1})")+"\n\n"
+    for n,p,i in rows:
+        txt += f"  🏢 {n}\n     💰 {fmt(p)} | 📈 {fmt(i)} 💵/24ч\n\n"
+    txt += f"{DIV}\n📝 /купбиз <название>"
+    send(peer_id, txt, kb_biz_page(page))
+
+
+def handle_chat_invite(peer_id, member_id):
+    if is_banned(member_id):
+        ch = peer_to_chat(peer_id)
+        if ch: kick_user(ch, member_id)
+
+
+# ============ ЗАПУСК ============
+def main():
+    log("⚔️ Бот запускается...")
+    try:
+        get_user(MAIN_OWNER)
+        for ow in OWNERS:
+            try:
+                get_user(ow)
+                cur.execute("UPDATE users SET role='Гл.Владелец', priority=101, balance=MAX(balance,999999999) WHERE user_id=?", (ow,))
+            except: pass
+        conn.commit()
+        cur.execute("SELECT COUNT(*) FROM jobs")
+        log(f"💼 Работ в базе: {cur.fetchone()[0]}")
+    except Exception as e:
+        log(f"⚠️ Owner init: {e}")
+
+    log("🎧 Слушаю события...")
+    while True:
+        try:
+            for event in longpoll.listen():
+                if event.type == VkBotEventType.MESSAGE_EVENT:
+                    try:
+                        eid = event.object.event_id
+                        ev_uid = event.object.user_id
+                        ev_peer = event.object.peer_id
+                        payload = event.object.payload
+                        is_dm = ev_peer < 2000000000
+                        if is_dm:
+                            vk.messages.sendMessageEventAnswer(
+                                event_id=eid, user_id=ev_uid, peer_id=ev_peer,
+                                event_data=json.dumps({"type":"show_snackbar","text":"OK"}))
+                            if isinstance(payload, dict) and payload.get("cmd"):
+                                handle_message(ev_peer, ev_uid, payload["cmd"])
+                        else:
+                            vk.messages.sendMessageEventAnswer(
+                                event_id=eid, user_id=ev_uid, peer_id=ev_peer,
+                                event_data=json.dumps({"type":"show_snackbar","text":"❗ Кнопки работают только в личке"}))
+                            send(ev_peer, f"❗ {mention(ev_uid)}, кнопки работают только в **личке бота**.\n\n📩 Напиши боту в личку и нажми /меню")
+                    except Exception as e: log(f"MEv: {e}")
+                    continue
+                if event.type != VkBotEventType.MESSAGE_NEW: continue
+                msg = event.object.message
+                peer_id = msg['peer_id']; uid = msg['from_id']
+                message_id = msg['id']; text = msg.get('text','')
+                action = msg.get('action')
+                if action:
+                    if action.get('type') in ('chat_invite_user','chat_invite_user_by_link'):
+                        member = action.get('member_id')
+                        if member and member > 0: handle_chat_invite(peer_id, member)
+                    continue
+                if not text: continue
+                try: handle_message(peer_id, uid, text, message_id, msg)
+                except Exception as e:
+                    log(f"Handler: {e}")
+                    traceback.print_exc(file=sys.stdout)
+        except Exception as e:
+            log(f"LongPoll: {e}")
+            traceback.print_exc(file=sys.stdout)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
