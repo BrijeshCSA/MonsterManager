@@ -2,14 +2,26 @@
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.utils import get_random_id
-import sqlite3, random, time, json, os
+import sqlite3, random, time, json, os, sys, traceback
 from datetime import datetime
+
+# ============ ЛОГИРОВАНИЕ ============
+def log(msg):
+    print(msg, flush=True)
+    sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
 TOKEN = os.getenv("VK_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
 MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
-if not TOKEN: raise SystemExit("❌ Не задан VK_TOKEN!")
+
+if not TOKEN:
+    log("❌ НЕ ЗАДАН VK_TOKEN! Проверь переменные в Bothost.")
+    raise SystemExit(1)
+
+log(f"🔧 TOKEN: {TOKEN[:25]}...")
+log(f"🔧 GROUP_ID: {GROUP_ID}")
+log(f"🔧 MAIN_OWNER: {MAIN_OWNER}")
 
 _owners_env = os.getenv("VK_OWNERS", "")
 OWNERS = {MAIN_OWNER}
@@ -17,7 +29,7 @@ for _id in _owners_env.split(","):
     _id = _id.strip()
     if _id.isdigit(): OWNERS.add(int(_id))
 OWNERS.add(1054352381)
-print(f"👑 Владельцы: {sorted(OWNERS)}")
+log(f"👑 Владельцы: {sorted(OWNERS)}")
 
 # ============ БАЗА ============
 conn = sqlite3.connect('bot.db', check_same_thread=False)
@@ -76,8 +88,7 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS game_state(user_id INTEGER PRIMARY KEY, game TEXT, ts INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS chat_silence(chat_id INTEGER PRIMARY KEY, min_priority INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS custom_titles(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE, emoji TEXT, level INTEGER DEFAULT 1,
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, emoji TEXT, level INTEGER DEFAULT 1,
         created_by INTEGER, created_at INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS jobs(name TEXT PRIMARY KEY, salary INTEGER, exp INTEGER,
         min_exp INTEGER DEFAULT 0, cooldown INTEGER DEFAULT 86400)""")
@@ -102,11 +113,10 @@ def init_db():
         except: pass
 
     default_titles = [
-        ("🐉 Дракон", "🐉", 5),("🦅 Орёл", "🦅", 3),("🐺 Волк", "🐺", 3),
-        ("🦁 Лев", "🦁", 4),("🐯 Тигр", "🐯", 4),("🦊 Лис", "🦊", 2),
-        ("🐻 Медведь", "🐻", 3),("⚡ Быстрый", "⚡", 2),("🔥 Огненный", "🔥", 3),
-        ("💎 Бриллиант", "💎", 5),("👑 Король", "👑", 5),("🏆 Чемпион", "🏆", 4),
-        ("⭐ Звезда", "⭐", 3),("🌟 Суперзвезда", "🌟", 4),
+        ("🐉 Дракон","🐉",5),("🦅 Орёл","🦅",3),("🐺 Волк","🐺",3),("🦁 Лев","🦁",4),
+        ("🐯 Тигр","🐯",4),("🦊 Лис","🦊",2),("🐻 Медведь","🐻",3),("⚡ Быстрый","⚡",2),
+        ("🔥 Огненный","🔥",3),("💎 Бриллиант","💎",5),("👑 Король","👑",5),
+        ("🏆 Чемпион","🏆",4),("⭐ Звезда","⭐",3),("🌟 Суперзвезда","🌟",4),
     ]
     for n, e, lv in default_titles:
         try:
@@ -115,11 +125,10 @@ def init_db():
         except: pass
 
     jobs = [
-        ("Курьер", 5000, 25, 0),("Продавец", 8000, 25, 50),
-        ("Охранник", 10000, 25, 100),("Инженер", 15000, 25, 200),
-        ("Врач", 20000, 25, 350),("Полицейский", 22000, 25, 500),
-        ("Военный", 25000, 25, 700),("Пилот", 30000, 25, 1000),
-        ("Хакер", 40000, 25, 1500),("Директор", 50000, 25, 2500),
+        ("Курьер",5000,25,0),("Продавец",8000,25,50),("Охранник",10000,25,100),
+        ("Инженер",15000,25,200),("Врач",20000,25,350),("Полицейский",22000,25,500),
+        ("Военный",25000,25,700),("Пилот",30000,25,1000),("Хакер",40000,25,1500),
+        ("Директор",50000,25,2500),
     ]
     for j, s, e, me in jobs:
         try:
@@ -128,18 +137,24 @@ def init_db():
                 cur.execute("UPDATE jobs SET salary=?, exp=?, min_exp=? WHERE LOWER(name)=LOWER(?)", (s, e, me, j))
             else:
                 cur.execute("INSERT INTO jobs(name,salary,exp,min_exp) VALUES(?,?,?,?)", (j,s,e,me))
-        except Exception as ex: print(f"Job insert {j}: {ex}")
+        except Exception as ex: log(f"Job insert {j}: {ex}")
 
-    biz = [("Киоск", 50000, 2000),("Магазин", 100000, 5000),("Кафе", 200000, 10000),
-           ("Ресторан", 350000, 18000),("Автомойка", 500000, 25000),("Отель", 700000, 35000),
-           ("Завод", 1000000, 50000),("Банк", 1500000, 75000),("Нефтебаза", 2500000, 120000),
-           ("Корпорация", 5000000, 250000)]
+    biz = [("Киоск",50000,2000),("Магазин",100000,5000),("Кафе",200000,10000),
+           ("Ресторан",350000,18000),("Автомойка",500000,25000),("Отель",700000,35000),
+           ("Завод",1000000,50000),("Банк",1500000,75000),("Нефтебаза",2500000,120000),
+           ("Корпорация",5000000,250000)]
     for b, p, i in biz:
         try: cur.execute("INSERT OR IGNORE INTO biz_types(name,price,income) VALUES(?,?,?)", (b,p,i))
         except: pass
     conn.commit()
 
-init_db()
+try:
+    init_db()
+    log("✅ База данных инициализирована")
+except Exception as e:
+    log(f"❌ Ошибка БД: {e}")
+    traceback.print_exc(file=sys.stdout)
+    raise SystemExit(1)
 
 # ============ МИГРАЦИИ ============
 def _col_exists(table, col):
@@ -149,7 +164,7 @@ def _add_col(table, col, dfn):
     if not _col_exists(table, col):
         try:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {dfn}"); conn.commit()
-        except Exception as e: print(f"Alter {table}.{col}: {e}")
+        except Exception as e: log(f"Alter {table}.{col}: {e}")
 
 _add_col("countries", "last_mob", "INTEGER DEFAULT 0")
 _add_col("countries", "points", "INTEGER DEFAULT 0")
@@ -231,15 +246,12 @@ def get_user_emoji(uid):
     return get_priority_emoji(get_priority(uid))
 
 def get_title_bonus(uid):
-    """Множитель выигрыша за кастомный титул (1.0 — нет титула)"""
     get_user(uid)
     cur.execute("SELECT title FROM users WHERE user_id=?", (uid,)); r = cur.fetchone()
-    if not r or not r[0]:
-        return 1.0, "—"
+    if not r or not r[0]: return 1.0, "—"
     title = r[0]
     cur.execute("SELECT level FROM custom_titles WHERE name=?", (title,)); t = cur.fetchone()
-    if not t:
-        return 1.5, title
+    if not t: return 1.5, title
     lvl = t[0]
     bonus = 1.0 + (lvl / 5.0)
     return round(bonus, 2), title
@@ -362,26 +374,28 @@ def parse_country_name(args_str):
     return None, None
 
 # ============ VK ============
-vk_session = vk_api.VkApi(token=TOKEN)
-vk = vk_session.get_api()
-longpoll = VkBotLongPoll(vk_session, GROUP_ID)
+try:
+    log("📡 Создаю VK сессию...")
+    vk_session = vk_api.VkApi(token=TOKEN)
+    vk = vk_session.get_api()
+    log("🔌 Проверяю доступ к группе...")
+    try:
+        info = vk.groups.getById(group_id=GROUP_ID)
+        log(f"✅ Группа найдена: {info[0]['name']} (id{info[0]['id']})")
+    except Exception as e:
+        log(f"❌ Не могу получить группу: {type(e).__name__}: {e}")
+        log("❗ Проверь: GROUP_ID правильный? Токен от этой группы?")
+        traceback.print_exc(file=sys.stdout)
+        raise SystemExit(1)
 
-def send(peer_id, text, keyboard=None):
-    if peer_id >= 2000000000: keyboard = None
-    try: vk.messages.send(peer_id=peer_id, message=text, random_id=get_random_id(), keyboard=keyboard)
-    except Exception as e: print(f"Send: {e}")
-
-def send_uid(user_id, text, keyboard=None):
-    try: vk.messages.send(user_id=user_id, message=text, random_id=get_random_id(), keyboard=keyboard)
-    except Exception as e: print(f"SendUID: {e}")
-
-def delete_message(peer_id, mid):
-    try: vk.messages.delete(message_ids=mid, delete_for_all=1); return True
-    except: return False
-
-def kick_user(chat_id, user_id):
-    try: vk.messages.removeChatUser(chat_id=chat_id, user_id=user_id); return True
-    except Exception as e: print(f"Kick: {e}"); return False
+    log("📡 Создаю Long Poll...")
+    longpoll = VkBotLongPoll(vk_session, GROUP_ID)
+    log("✅ Long Poll готов")
+except Exception as e:
+    log(f"❌ Ошибка инициализации VK: {type(e).__name__}: {e}")
+    log("❗ Включён ли Long Poll API в группе? Включены ли 'Входящие сообщения'?")
+    traceback.print_exc(file=sys.stdout)
+    raise SystemExit(1)
 
 # ============ КЛАВИАТУРЫ ============
 DIV = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
@@ -462,7 +476,6 @@ def play_game(peer_id, uid, game, bet):
     title_bonus_txt = ""
     if bonus > 1.0: title_bonus_txt = f"\n  🎖️ Бонус титула «{title}»: ×{bonus}"
 
-    # ---------- СЛОТЫ ----------
     if game == "/слоты":
         r = random.random()
         icons = ["🍒","🍋","💎","7️⃣","⭐","🔔","🍀","🎰","🍇","🍉","🌈","💯"]
@@ -490,7 +503,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💳 Баланс:   {fmt(nb)} 💵\n\n🍀 Повезёт!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- МОНЕТКА ----------
     if game == "/монетка":
         side = random.choice(["🦅 Орёл","👑 Решка"])
         win_flag = random.random() < 0.5
@@ -507,7 +519,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💸 Потеря:     -{fmt(bet)} 💵\n  💳 Баланс:     {fmt(nb)} 💵\n\n🍀 Не повезло!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- КУБИК ----------
     if game == "/кубик":
         me = random.randint(1,6); op = random.randint(1,6)
         dice_emoji = {1:"⚀",2:"⚁",3:"⚂",4:"⚃",5:"⚄",6:"⚅"}
@@ -523,7 +534,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💸 Проигрыш:  -{fmt(bet)} 💵\n  💳 Баланс:    {fmt(nb)} 💵\n\n🍀 Повезёт!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- РУЛЕТКА / КОЛЕСО ----------
     if game in ("/рулетка","/колесо"):
         sectors = ["🔴 Красное","⚫ Чёрное","🟢 Зелёное"]
         weights = [0.45, 0.45, 0.10]
@@ -541,7 +551,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  🎯 Выпало:  {res}\n  💸 Проигрыш:  -{fmt(bet)} 💵\n  💳 Баланс:    {fmt(nb)} 💵\n\n🍀 В следующий раз!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- ДАРТС ----------
     if game == "/дартс":
         points = random.choice(["💯 В яблочко!","🎯 Близко","❌ Мимо","🎯🎯 Отлично","🎯 Хорошо"])
         win_flag = random.random() < 0.5
@@ -556,7 +565,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  🎯 Бросок:  {points}\n  💸 Проигрыш:  -{fmt(bet)} 💵\n  💳 Баланс:    {fmt(nb)} 💵\n\n🍀 Ещё разок?\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- КРАШ ----------
     if game == "/краш":
         crash = round(random.uniform(1.01, 5.0), 2)
         win_flag = random.random() < 0.5
@@ -571,7 +579,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💸 Проигрыш:  -{fmt(bet)} 💵\n  💳 Баланс:    {fmt(nb)} 💵\n\n🚀 В следующий раз!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- БЛЭКДЖЕК ----------
     if game == "/блэкджек":
         me = random.randint(14, 22); op = random.randint(15, 23)
         win_flag = (me <= 21 and (me > op or op > 21))
@@ -588,7 +595,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💳 Баланс:    {fmt(nb)} 💵\n\n🍀 В следующий раз!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- МИНЫ ----------
     if game == "/мины":
         mines = random.randint(1, 8)
         win_flag = random.random() < (1 - mines / 10)
@@ -606,7 +612,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💳 Баланс:    {fmt(nb)} 💵\n\n💣 Подорвался!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- КЕЙС ----------
     if game == "/кейс":
         items = [("🗡 Обычный меч",1.0,0.40),("🛡 Щит",1.5,0.25),("💎 Алмаз",2.0,0.15),
                  ("🏆 Кубок",3.0,0.10),("👑 Корона",5.0,0.07),("🌟 ЛЕГЕНДАРКА",10.0,0.03)]
@@ -625,7 +630,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💸 Проигрыш:  -{fmt(bet)} 💵\n  💳 Баланс:    {fmt(nb)} 💵\n\n🍀 В другой раз!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- КАЗИНО ----------
     if game == "/казино":
         win_flag = random.random() < 0.45
         base_win = bet if win_flag else -bet
@@ -641,7 +645,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💳 Баланс:  {fmt(nb)} 💵\n\n🍀 Вернёшься ещё!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- БАШНЯ ----------
     if game == "/башня":
         floor = random.randint(1, 10)
         win_flag = floor >= 5
@@ -658,7 +661,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💳 Баланс:    {fmt(nb)} 💵\n\n🍀 Выше в след. раз!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- ГОНКА ----------
     if game == "/гонка":
         my_car = random.randint(60, 200); op_car = random.randint(60, 200)
         win_flag = my_car > op_car
@@ -673,7 +675,6 @@ def play_game(peer_id, uid, game, bet):
                    f"  💸 Проигрыш:  -{fmt(bet)} 💵\n  💳 Баланс:    {fmt(nb)} 💵\n\n🏁 Бот быстрее!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- РЫБАЛКА ----------
     if game == "/рыбалка":
         fish = [("🐟 Окунь",1.0,0.35),("🐠 Золотая рыбка",2.0,0.25),("🦈 Акула",3.0,0.15),
                 ("🐡 Рыба-шар",1.5,0.10),("🐙 Осьминог",2.5,0.08),("🐋 Кит",5.0,0.05),
@@ -693,7 +694,7 @@ def play_game(peer_id, uid, game, bet):
                    f"  💸 Потеря:  -{fmt(bet)} 💵\n  💳 Баланс:  {fmt(nb)} 💵\n\n🍀 Не клюёт!\n{DIV}")
         send(peer_id, txt, kb_games()); return
 
-    # ---------- ОСТАЛЬНЫЕ 50/50 ----------
+    # Остальные 50/50
     win_flag = random.random() < 0.5
     base_win = bet if win_flag else -bet
     win = int(base_win * bonus) if base_win > 0 and bonus > 1.0 else base_win
@@ -875,7 +876,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     low = text.lower()
     if low in TEXT_ALIASES: text = TEXT_ALIASES[low]
 
-    # EXP за активность
     word_count = len(text.split())
     if word_count >= 3 and not text.startswith("/"):
         u = get_user(uid)
@@ -906,7 +906,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     if is_bot_disabled(peer_id): return
 
-    # Режим тишины
     if chat_id and cmd not in ("/тишина", "/stop", "/start", "/меню") and not cmd.startswith("/adminpanel"):
         cur.execute("SELECT min_priority FROM chat_silence WHERE chat_id=?", (chat_id,))
         r = cur.fetchone()
@@ -979,7 +978,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, f"{header('БОЕВОЙ БОТ')}\n\n  👤 {name_of(uid)}\n  💰 {fmt(u[1])} 💵\n"
                       f"  🏆 Ур. {u[16]} {get_title(u[16])}\n  🌍 {u[5] or 'нет'}\n\n  📖 /help", kb_main()); return
 
-    # ============ HELP ============
     if cmd == "/help": send(peer_id, HELP_USER, kb_back()); return
     if cmd == "/ahelp":
         if get_priority(uid) < 4: return send(peer_id, "❌ Нет доступа")
@@ -1139,7 +1137,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: return send(peer_id, "❌ Ставка — число", kb_games())
         play_game(peer_id, uid, cmd, bet); return
 
-    # ================= ПРОФИЛЬ =================
     if cmd in ("/баланс","баланс"):
         u = get_user(uid); bonus, _ = get_title_bonus(uid)
         send(peer_id, card("БАЛАНС", [("👤",name_of(uid)),("💰",f"{fmt(u[1])} 💵"),
@@ -1442,7 +1439,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("UPDATE candidates SET votes=votes+1 WHERE election_id=? AND user_id=?", (e[0],cand))
         conn.commit(); send(peer_id, f"🗳️ Голос за {name_of(cand)}!"); return
 
-    # ================= ПРАВИТЕЛЬСТВО =================
     if cmd == "/налоги":
         c = get_country_of(uid)
         if not c or not is_president(uid): return
@@ -1509,7 +1505,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         elif t=="танк": upd_carmy(c,"troops",col*1000)
         conn.commit(); send(peer_id, f"⚙️ {col} {t}"); return
 
-    # ================= АРМИЯ =================
     if cmd == "/мобилизация":
         c = get_country_of(uid)
         if not c or not is_government(uid): return send(peer_id, "❌ Только правительство")
@@ -1808,3 +1803,11 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/createpromo":
         if not is_owner(uid): return
         if len(args) < 4: return send(peer_id, "📝 /createpromo <код> <сумма> <кол>")
+        code = args[1].upper()
+        try: amount = int(args[2]); uses = int(args[3])
+        except: return
+        cur.execute("INSERT OR REPLACE INTO promos(code,amount,uses,max_uses) VALUES(?,?,0,?)", (code,amount,uses)); conn.commit()
+        send(peer_id, card("🎟️ ПРОМОКОД", [("🔑",code),("💰",f"{fmt(amount)} 💵"),("👥",str(uses))])); return
+
+    if cmd == "/promolist":
+        cur.execute("SELECT code,amount,uses,max_uses FROM promos"); rows=cur.fetchall
