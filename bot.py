@@ -42,7 +42,7 @@ def init_db():
         biz INTEGER DEFAULT 0, biz_income INTEGER DEFAULT 0, biz_collect INTEGER DEFAULT 0,
         subscription INTEGER DEFAULT 0, points INTEGER DEFAULT 0, exp INTEGER DEFAULT 0, level INTEGER DEFAULT 0,
         work TEXT, work_last INTEGER DEFAULT 0, password TEXT, exp_last INTEGER DEFAULT 0,
-        title TEXT, rep INTEGER DEFAULT 0, daily INTEGER DEFAULT 0)""")
+        title TEXT, rep INTEGER DEFAULT 0, daily INTEGER DEFAULT 0, mute_notify INTEGER DEFAULT 0)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS countries(name TEXT PRIMARY KEY, flag TEXT,
         owner INTEGER, president INTEGER, treasury INTEGER DEFAULT 100000, army INTEGER DEFAULT 100000,
         cities INTEGER DEFAULT 1, taxes INTEGER DEFAULT 5, pvo INTEGER DEFAULT 0,
@@ -180,6 +180,7 @@ _add_col("users", "rep", "INTEGER DEFAULT 0")
 _add_col("users", "daily", "INTEGER DEFAULT 0")
 _add_col("jobs", "min_exp", "INTEGER DEFAULT 0")
 _add_col("roles", "emoji", "TEXT DEFAULT '🎭'")
+_add_col("users", "mute_notify", "INTEGER DEFAULT 0")
 
 # ============ ХЕЛПЕРЫ ============
 def get_user(uid):
@@ -190,7 +191,6 @@ def get_user(uid):
     return r
 
 def ufield(uid, field, default=None):
-    """Безопасно берёт поле пользователя по имени столбца"""
     get_user(uid)
     cur.execute(f"SELECT {field} FROM users WHERE user_id=?", (uid,))
     r = cur.fetchone()
@@ -287,6 +287,20 @@ def is_banned(uid):
 
 def peer_to_chat(p): return p - 2000000000 if p >= 2000000000 else None
 def fmt(n): return f"{n:,}".replace(",", " ")
+
+def time_left_fmt(seconds):
+    seconds = int(seconds)
+    if seconds <= 0: return "0 сек"
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    parts = []
+    if d: parts.append(f"{d} дн")
+    if h: parts.append(f"{h} ч")
+    if m and not d: parts.append(f"{m} мин")
+    if s and not d and not h: parts.append(f"{s} сек")
+    return " ".join(parts) if parts else "0 сек"
 
 def is_bot_disabled(peer_id):
     cur.execute("SELECT peer_id FROM bot_disabled WHERE peer_id=?", (peer_id,))
@@ -946,6 +960,32 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     if is_bot_disabled(peer_id): return
 
+    # Бан с уведомлением
+    ban_reason = is_banned(uid)
+    if ban_reason and not is_owner(uid):
+        if chat_id: kick_user(chat_id, uid)
+        if peer_id < 2000000000:
+            send_uid(uid,
+                f"{DIV}\n     🚫 ВЫ ЗАБАНЕНЫ\n{DIV}\n\n"
+                f"  📝 Причина: {ban_reason}\n"
+                f"  ⏳ Срок: навсегда\n"
+                f"  ❌ Все команды запрещены\n\n{DIV}")
+        return
+
+    # Мут с уведомлением + полная блокировка
+    mute_left = is_muted(uid)
+    if mute_left > 0 and not is_admin(uid):
+        if message_id: delete_message(peer_id, message_id)
+        now = int(time.time())
+        last_notify = ufield(uid, "mute_notify", 0) or 0
+        if peer_id < 2000000000 or now - last_notify > 60:
+            cur.execute("UPDATE users SET mute_notify=? WHERE user_id=?", (now, uid)); conn.commit()
+            send_uid(uid,
+                f"{DIV}\n     🔇 ВЫ В МУТЕ\n{DIV}\n\n"
+                f"  ⏳ Осталось: {time_left_fmt(mute_left)}\n"
+                f"  🚫 Писать запрещено во всех чатах и в ЛС бота\n\n{DIV}")
+        return
+
     if chat_id and cmd not in ("/тишина", "/stop", "/start", "/меню") and not cmd.startswith("/adminpanel"):
         cur.execute("SELECT min_priority FROM chat_silence WHERE chat_id=?", (chat_id,))
         r = cur.fetchone()
@@ -999,13 +1039,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for tu, prio, pw in rows:
             txt += f"  🎭 {name_of(tu)}\n     🆔 id{tu}\n     📊 Приоритет: {prio}\n     🔑 Пароль: `{pw}`\n\n"
         send(peer_id, txt + f"{DIV}\n⚠️ Храните в тайне!"); return
-
-    if is_banned(uid) and not is_owner(uid):
-        if chat_id: kick_user(chat_id, uid)
-        return
-    if is_muted(uid) > 0 and not is_admin(uid):
-        if message_id: delete_message(peer_id, message_id)
-        return
 
     gs = get_game_state(uid)
     if gs and text.strip().lstrip("-").isdigit() and not cmd.startswith("/"):
@@ -1197,15 +1230,19 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, txt + f"\n{DIV}", kb_back()); return
 
     if cmd in ("/приз","приз"):
-        last = ulast_bonus(uid)
-        left = 3600 - (int(time.time()) - (last or 0))
+        last = ulast_bonus(uid) or 0
+        left = 86400 - (int(time.time()) - last)
         if left > 0:
-            m = left // 60; s = left % 60
-            return send(peer_id, f"⏳ Приз через {m} мин {s} сек", kb_back())
-        amount = random.randint(100, 900000); upd_balance(uid, amount)
-        cur.execute("UPDATE users SET last_bonus=? WHERE user_id=?", (int(time.time()), uid)); conn.commit()
+            h = left // 3600
+            m = (left % 3600) // 60
+            return send(peer_id, f"⏳ Следующий приз через {h}ч {m}мин", kb_back())
+        amount = random.randint(100, 900000)
+        upd_balance(uid, amount)
+        cur.execute("UPDATE users SET last_bonus=? WHERE user_id=?", (int(time.time()), uid))
+        conn.commit()
         add_exp(uid, 5)
-        send(peer_id, f"🎁 +{fmt(amount)} 💵 | +5 exp\n\n⏰ Следующий через час", kb_back()); return
+        send(peer_id, f"🎁 +{fmt(amount)} 💵 | +5 exp\n\n⏰ Следующий через 24 часа", kb_back())
+        return
 
     if cmd == "/ежедневно" or cmd == "/daily":
         last = udaily(uid)
@@ -1857,17 +1894,19 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for c,a,u,m in rows: txt += f"  🎟️ {c} — {fmt(a)} 💵 ({u}/{m})\n"
         send(peer_id, txt + f"\n{DIV}"); return
 
-    # МОДЕРАЦИЯ
+    # ================= МОДЕРАЦИЯ =================
     if cmd == "/warn":
-        if not is_admin(uid): return
+        if not is_admin(uid): return send(peer_id, "❌ Нет прав")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t: return
+        if is_owner(t) or is_admin(t): return send(peer_id, "❌ Нельзя")
         get_user(t); cur.execute("UPDATE users SET warns=warns+1 WHERE user_id=?", (t,)); conn.commit()
         cur.execute("SELECT warns FROM users WHERE user_id=?", (t,)); w=cur.fetchone()[0]
         if w>=3:
             cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t,"3 варна")); conn.commit()
             if chat_id: kick_user(chat_id, t)
-            send(peer_id, f"🚫 {mention(t)} автобан")
+            send(peer_id, f"🚫 {mention(t)} автобан (3/3)")
+            send_uid(t, f"🚫 Вы забанены (3/3 варна)")
         else: send(peer_id, f"⚠️ Варн {w}/3 для {mention(t)}")
         return
 
@@ -1879,21 +1918,36 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, f"✅ Снят с {mention(t)}"); return
 
     if cmd == "/mute":
-        if not is_admin(uid): return
+        if not is_admin(uid): return send(peer_id, "❌ Нет прав")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
-        if not t: return
+        if not t: return send(peer_id, "📝 /mute <юзер> <минут> [причина]")
         try: m = int(args[2]) if len(args)>2 else 60
         except: m = 60
-        if is_owner(t) or is_admin(t): return
-        cur.execute("UPDATE users SET mute_until=? WHERE user_id=?", (int(time.time())+m*60,t)); conn.commit()
-        send(peer_id, f"🔇 {mention(t)} — {m}м"); return
+        if is_owner(t) or is_admin(t):
+            return send(peer_id, "❌ Нельзя замутить админа или владельца")
+        reason = " ".join(args[3:]) if len(args) > 3 else "не указана"
+        get_user(t)
+        until = int(time.time()) + m*60
+        cur.execute("UPDATE users SET mute_until=? WHERE user_id=?", (until, t))
+        conn.commit()
+        dt_str = datetime.fromtimestamp(until).strftime("%d.%m.%Y %H:%M")
+        cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); ar = cur.fetchone()
+        admin_nick = ar[0] if ar and ar[0] else f"id{uid}"
+        txt = (f"{DIV}\n     🔇 МУТ ВЫДАН\n{DIV}\n\n"
+               f"  ✅ Кому: {mention(t)}\n"
+               f"  ⏳ Срок: {time_left_fmt(m*60)} (до {dt_str})\n"
+               f"  📝 Причина: {reason}\n"
+               f"  👮 Модератор: @id{uid} ({admin_nick})\n\n{DIV}")
+        send(peer_id, txt)
+        send_uid(t, txt + f"\n\n🚫 Пока мут активен — писать запрещено во всех чатах и в ЛС бота.")
+        return
 
     if cmd == "/unmute":
         if not is_admin(uid): return
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t: return
-        cur.execute("UPDATE users SET mute_until=0 WHERE user_id=?", (t,)); conn.commit()
-        send(peer_id, f"🔊 {mention(t)}"); return
+        cur.execute("UPDATE users SET mute_until=0, mute_notify=0 WHERE user_id=?", (t,)); conn.commit()
+        send(peer_id, f"🔊 {mention(t)} размучен"); return
 
     if cmd == "/kick":
         if not is_admin(uid): return
@@ -1903,28 +1957,64 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         kick_user(chat_id, t); send(peer_id, f"👢 {mention(t)}"); return
 
     if cmd == "/ban":
-        if not is_admin(uid): return
+        if not is_admin(uid): return send(peer_id, "❌ Нет прав")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
-        if not t or is_owner(t) or is_admin(t): return
+        if not t: return send(peer_id, "📝 /ban <юзер> [причина]")
+        if is_owner(t) or is_admin(t):
+            return send(peer_id, "❌ Нельзя забанить админа или владельца")
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
-        cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t,reason)); conn.commit()
+        cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t, reason))
+        conn.commit()
         if chat_id: kick_user(chat_id, t)
-        send(peer_id, f"🚫 {mention(t)}: {reason}"); return
+        cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); ar = cur.fetchone()
+        admin_nick = ar[0] if ar and ar[0] else f"id{uid}"
+        txt = (f"{DIV}\n     🚫 БАН ВЫДАН\n{DIV}\n\n"
+               f"  ✅ Кому: {mention(t)}\n"
+               f"  ⏳ Срок: навсегда\n"
+               f"  📝 Причина: {reason}\n"
+               f"  👮 Модератор: @id{uid} ({admin_nick})\n\n{DIV}")
+        send(peer_id, txt)
+        send_uid(t, txt + f"\n\n❌ Все команды запрещены. Обратитесь к администрации.")
+        return
 
     if cmd == "/unban":
         if not is_admin(uid): return
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t: return
         cur.execute("DELETE FROM bans WHERE user_id=?", (t,)); conn.commit()
-        send(peer_id, f"✅ {mention(t)}"); return
+        send(peer_id, f"✅ {mention(t)} разбанен"); return
 
     if cmd == "/gban":
-        if not is_owner(uid): return
+        if not is_owner(uid):
+            return send(peer_id, "❌ Только владелец")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
-        if not t: return
-        cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t,"GBAN")); conn.commit()
-        if chat_id: kick_user(chat_id, t)
-        send(peer_id, f"🚫 GBAN id{t}"); return
+        if not t: return send(peer_id, "📝 /gban <юзер> [причина]")
+        if t in OWNERS:
+            return send(peer_id, "❌ Нельзя забанить владельца")
+        reason = " ".join(args[2:]) if len(args) > 2 else "не указана"
+        cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t, reason))
+        conn.commit()
+        kicked = 0
+        cur.execute("SELECT chat_id FROM builds"); chats = cur.fetchall()
+        for (cid,) in chats:
+            try:
+                vk.messages.removeChatUser(chat_id=cid, user_id=t)
+                kicked += 1
+            except: pass
+        if chat_id:
+            if kick_user(chat_id, t): kicked += 1
+        cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); ar = cur.fetchone()
+        admin_nick = ar[0] if ar and ar[0] else f"id{uid}"
+        txt = (f"{DIV}\n     🚫 ГЛОБАЛЬНЫЙ БАН\n{DIV}\n\n"
+               f"  ✅ Кому: {mention(t)}\n"
+               f"  ⏳ Срок: навсегда\n"
+               f"  📝 Причина: {reason}\n"
+               f"  👮 Модератор: @id{uid} ({admin_nick})\n"
+               f"  🏛 Кикнут из {kicked} бесед\n"
+               f"  🌐 Заблокирован во всех чатах с ботом\n\n{DIV}")
+        send(peer_id, txt)
+        send_uid(t, txt + f"\n\n❌ Все команды запрещены. Обратитесь к владельцу.")
+        return
 
     if cmd == "/banlist":
         cur.execute("SELECT user_id,reason FROM bans"); rows=cur.fetchall()
