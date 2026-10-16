@@ -43,6 +43,24 @@ STYLES = {
 }
 CURRENT_STYLE = "обычный"
 
+# ============ КОНСТАНТЫ ИГР ============
+RAID_COST = 50000
+RAID_COOLDOWN = 3600
+RAID_SUCCESS_CHANCE = 0.40
+
+MAT_ROOTS = (
+    "хуй","хуя","хую","хуе","хуё","хер","хрен",
+    "пизд","пизж","пезд",
+    "бля","бляд","блят",
+    "ебан","ебал","ебуч","ебат","ебет","ебёт","ебну","ебля",
+    "сука","суки","сучк",
+    "мудак","мудил","мудозв",
+    "гандон","гондон",
+    "долбоеб","долбоёб",
+    "залуп","шлюх","шалав",
+    "fuck","shit","bitch","cunt","dick","pussy","asshole",
+)
+
 # ============ БАЗА ============
 conn = sqlite3.connect('bot.db', check_same_thread=False)
 cur = conn.cursor()
@@ -119,8 +137,12 @@ def init_db():
         user_id INTEGER, tariff TEXT, price INTEGER, text TEXT, status TEXT DEFAULT 'wait_pay',
         created INTEGER, paid_at INTEGER, confirmed_by INTEGER, sent_at INTEGER,
         sent_count INTEGER DEFAULT 0, duration INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS admin_stats(user_id INTEGER PRIMARY KEY,
+        bans INTEGER DEFAULT 0, mutes INTEGER DEFAULT 0, warns INTEGER DEFAULT 0,
+        reports INTEGER DEFAULT 0, offers INTEGER DEFAULT 0, tickets INTEGER DEFAULT 0)""")
     conn.commit()
 
+    # --- БАЗОВЫЕ РОЛИ ---
     base_roles = [
         ("Гл.Владелец",15,101,"👑"),("Владелец",14,100,"💎"),
         ("Зам. Владельца",14,99,"🎭"),("Генеральный Деректор",14,98,"🎭"),
@@ -148,6 +170,7 @@ def init_db():
                         (n, lvl, prio, emo, MAIN_OWNER, int(time.time())))
         except: pass
 
+    # --- 20 СТРАН ---
     countries_data = {
         "Россия": ("🇷🇺", ["Москва", "Санкт-Петербург", "Новосибирск"], "Москва"),
         "США": ("🇺🇸", ["Вашингтон", "Нью-Йорк", "Лос-Анджелес"], "Вашингтон"),
@@ -183,6 +206,7 @@ def init_db():
                             (ct, cn, 1, 10000, 5000, 1000, is_cap))
         except: pass
 
+    # --- ТИТУЛЫ ---
     default_titles = [
         ("🐉 Дракон","🐉",5),("🦅 Орёл","🦅",3),("🐺 Волк","🐺",3),("🦁 Лев","🦁",4),
         ("🐯 Тигр","🐯",4),("🦊 Лис","🦊",2),("🐻 Медведь","🐻",3),("⚡ Быстрый","⚡",2),
@@ -195,6 +219,7 @@ def init_db():
                         (n, e, lv, MAIN_OWNER, int(time.time())))
         except: pass
 
+    # --- РАБОТЫ ---
     jobs = [
         ("Курьер",5000,25,0),("Продавец",8000,25,50),("Охранник",10000,25,100),
         ("Инженер",15000,25,200),("Врач",20000,25,350),("Полицейский",22000,25,500),
@@ -210,6 +235,7 @@ def init_db():
                 cur.execute("INSERT INTO jobs(name,salary,exp,min_exp) VALUES(?,?,?,?)", (j,s,e,me))
         except: pass
 
+    # --- БИЗНЕСЫ ---
     biz = [
         ("Киоск",50000,2000),("Магазин",100000,5000),("Кафе",200000,10000),
         ("Ресторан",350000,18000),("Автомойка",500000,25000),("Отель",700000,35000),
@@ -231,6 +257,7 @@ def init_db():
         try: cur.execute("INSERT OR IGNORE INTO biz_types(name,price,income) VALUES(?,?,?)", (b,p,i))
         except: pass
 
+    # --- ТАРИФЫ ПИАРА ---
     try:
         cur.execute("DELETE FROM pr_tariffs WHERE name IN ('Малый','Средний','Большой','VIP')")
         conn.commit()
@@ -271,370 +298,13 @@ for t, c, d in [
     ("roles","emoji","TEXT DEFAULT '🎭'"),("builds","type","TEXT DEFAULT 'chat'"),
     ("pr_orders","duration","INTEGER DEFAULT 0"),("pr_orders","expires_at","INTEGER DEFAULT 0"),
     ("cities","last_collect","INTEGER DEFAULT 0"),
+    ("users","raid_last","INTEGER DEFAULT 0"),
+    ("users","msg_count","INTEGER DEFAULT 0"),
+    ("users","mat_count","INTEGER DEFAULT 0"),
+    ("users","captures","INTEGER DEFAULT 0"),
 ]:
     _add_col(t, c, d)
-
-def load_style():
-    global CURRENT_STYLE
-    cur.execute("SELECT value FROM bot_settings WHERE key='style'")
-    r = cur.fetchone()
-    if r and r[0] in STYLES: CURRENT_STYLE = r[0]
-    else: CURRENT_STYLE = "обычный"
-    log(f"🎨 Стиль: {STYLES[CURRENT_STYLE]['name']}")
-load_style()
-
-def set_style(name):
-    global CURRENT_STYLE
-    if name not in STYLES: return False
-    CURRENT_STYLE = name
-    cur.execute("INSERT OR REPLACE INTO bot_settings(key,value) VALUES(?,?)", ("style", name))
-    conn.commit(); return True
-
-def style_cfg(): return STYLES.get(CURRENT_STYLE, STYLES["обычный"])
-def style_div(): return style_cfg()["div"] * 16
-def style_emoji(): return style_cfg()["emoji"]
-def style_bonus(): return style_cfg()["bonus"]
-def style_name(): return style_cfg()["name"]
-    # ============ ХЕЛПЕРЫ ============
-def get_user(uid):
-    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,)); r = cur.fetchone()
-    if not r:
-        cur.execute("INSERT INTO users(user_id) VALUES(?)", (uid,)); conn.commit()
-        cur.execute("SELECT * FROM users WHERE user_id=?", (uid,)); r = cur.fetchone()
-    return r
-
-def ufield(uid, field, default=None):
-    get_user(uid)
-    try:
-        cur.execute(f"SELECT {field} FROM users WHERE user_id=?", (uid,))
-        r = cur.fetchone()
-        return r[0] if r and r[0] is not None else default
-    except: return default
-
-def ubal(uid): return ufield(uid, "balance", 0)
-def ubank(uid): return ufield(uid, "bank", 0)
-def uexp(uid): return ufield(uid, "exp", 0)
-def ulevel(uid): return ufield(uid, "level", 0)
-def ucountry(uid): return ufield(uid, "country", None)
-def uwork(uid): return ufield(uid, "work", None)
-def utitle(uid): return ufield(uid, "title", None)
-def urep(uid): return ufield(uid, "rep", 0)
-def udaily(uid): return ufield(uid, "daily", 0)
-def ulast_bonus(uid): return ufield(uid, "last_bonus", 0)
-def umute(uid): return ufield(uid, "mute_until", 0)
-def upassword(uid): return ufield(uid, "password", None)
-def upriority(uid): return ufield(uid, "priority", 0)
-def uexp_last(uid): return ufield(uid, "exp_last", 0)
-
-def get_password(uid): return upassword(uid)
-def set_password(uid, pw):
-    get_user(uid); cur.execute("UPDATE users SET password=? WHERE user_id=?", (pw, uid)); conn.commit()
-def upd_balance(uid, amount):
-    get_user(uid); cur.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, uid)); conn.commit()
-def upd_bank(uid, amount):
-    get_user(uid); cur.execute("UPDATE users SET bank=bank+? WHERE user_id=?", (amount, uid)); conn.commit()
-def get_balance(uid): return ubal(uid)
-def get_bank(uid): return ubank(uid)
-
-LEVEL_TITLES = [
-    (0,"🌱 Новичок"),(10,"🪖 Рядовой"),(25,"🎯 Боец"),(50,"⚔️ Воин"),
-    (75,"🛡 Ветеран"),(100,"🏅 Сержант"),(150,"🎖️ Лейтенант"),(200,"👑 Капитан"),
-    (300,"⚜️ Майор"),(400,"💫 Полковник"),(500,"🔥 Генерал"),(650,"⭐ Маршал"),
-    (800,"🌟 Легенда"),(950,"👑 Император"),(999,"🏆 БОГ ВОЙНЫ")
-]
-def get_title(level):
-    t = LEVEL_TITLES[0][1]
-    for lv, name in LEVEL_TITLES:
-        if level >= lv: t = name
-    return t
-
-PRIORITY_PREFIX = [
-    (101,"👑"),(100,"💎"),(90,"💫"),(80,"⚡"),(70,"👑"),(60,"👑"),
-    (50,"⚔️"),(40,"⚔️"),(30,"🛡"),(20,"🔨"),(10,"🎯"),(4,"🌿"),(0,"🌱"),
-]
-def get_priority_emoji(priority):
-    for p, emo in PRIORITY_PREFIX:
-        if priority >= p: return emo
-    return "🌱"
-
-def get_priority(uid):
-    if uid in OWNERS: return 101
-    p = upriority(uid)
-    if p and p > 0: return p
-    cur.execute("SELECT r.priority FROM global_roles gr JOIN roles r ON r.name=gr.role WHERE gr.user_id=?", (uid,))
-    r2 = cur.fetchone()
-    if r2 and r2[0] is not None: return r2[0]
-    return 0
-
-def get_user_emoji(uid):
-    t = utitle(uid)
-    if t:
-        emoji = ""
-        for ch in t:
-            if ord(ch) > 0x2600: emoji += ch
-        if emoji: return emoji
-    return get_priority_emoji(get_priority(uid))
-
-def get_title_bonus(uid):
-    title = utitle(uid)
-    if not title: return 1.0, "—"
-    cur.execute("SELECT level FROM custom_titles WHERE name=?", (title,)); t = cur.fetchone()
-    if not t: return 1.5, title
-    lvl = t[0]
-    return round(1.0 + (lvl/5.0), 2), title
-
-def is_owner(uid):
-    if uid in OWNERS: return True
-    return get_priority(uid) >= 80
-def is_admin(uid): return get_priority(uid) >= 10
-def is_staff(uid): return get_priority(uid) >= 4
-
-def is_muted(uid):
-    m = umute(uid)
-    if m and m > int(time.time()): return m - int(time.time())
-    return 0
-
-def is_banned(uid):
-    cur.execute("SELECT reason FROM bans WHERE user_id=?", (uid,)); r = cur.fetchone()
-    return r[0] if r else None
-
-def peer_to_chat(p): return p - 2000000000 if p >= 2000000000 else None
-def fmt(n): return f"{n:,}".replace(",", " ")
-
-def time_left_fmt(seconds):
-    seconds = int(seconds)
-    if seconds <= 0: return "0 сек"
-    d = seconds // 86400; h = (seconds % 86400) // 3600
-    m = (seconds % 3600) // 60; s = seconds % 60
-    parts = []
-    if d: parts.append(f"{d} дн")
-    if h: parts.append(f"{h} ч")
-    if m and not d: parts.append(f"{m} мин")
-    if s and not d and not h: parts.append(f"{s} сек")
-    return " ".join(parts) if parts else "0 сек"
-
-def is_bot_disabled(peer_id):
-    cur.execute("SELECT peer_id FROM bot_disabled WHERE peer_id=?", (peer_id,))
-    return bool(cur.fetchone())
-
-def name_of(uid):
-    emoji = get_user_emoji(uid)
-    cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); r = cur.fetchone()
-    nick = r[0] if r and r[0] else None
-    if not nick:
-        try:
-            u = vk.users.get(user_ids=uid)[0]
-            nick = f"{u['first_name']} {u['last_name']}"
-        except: nick = f"id{uid}"
-    custom = utitle(uid)
-    if custom: return f"{emoji} {custom} {nick}"
-    return f"{emoji} {nick}"
-
-def mention(uid): return f"@id{uid} ({name_of(uid)})"
-
-def extract_uid(arg, msg=None):
-    if msg and msg.get('reply_message'): return msg['reply_message']['from_id']
-    if not arg: return None
-    if arg.startswith('[id') and '|' in arg:
-        try: return int(arg[3:].split('|')[0])
-        except: pass
-    if arg.startswith('@'):
-        try:
-            r = vk.utils.resolveScreenName(screen_name=arg[1:])
-            if r and r.get('type') == 'user': return r['object_id']
-        except: pass
-    try: return int(arg)
-    except: return None
-
-def get_country(n):
-    cur.execute("SELECT * FROM countries WHERE name=?", (n,)); return cur.fetchone()
-def get_country_of(uid): return ucountry(uid)
-def get_stock(c):
-    cur.execute("SELECT * FROM stockpile WHERE country=?", (c,)); r = cur.fetchone()
-    if not r:
-        cur.execute("INSERT INTO stockpile(country) VALUES(?)", (c,)); conn.commit()
-        cur.execute("SELECT * FROM stockpile WHERE country=?", (c,)); r = cur.fetchone()
-    return r
-def upd_stock(c, f, a):
-    get_stock(c); cur.execute(f"UPDATE stockpile SET {f}={f}+? WHERE country=?", (a, c)); conn.commit()
-def get_carmy(c):
-    cur.execute("SELECT * FROM country_army WHERE country=?", (c,)); r = cur.fetchone()
-    if not r:
-        cur.execute("INSERT INTO country_army(country) VALUES(?)", (c,)); conn.commit()
-        cur.execute("SELECT * FROM country_army WHERE country=?", (c,)); r = cur.fetchone()
-    return r
-def upd_carmy(c, f, a):
-    get_carmy(c); cur.execute(f"UPDATE country_army SET {f}={f}+? WHERE country=?", (a, c)); conn.commit()
-def get_position(uid):
-    cur.execute("SELECT position FROM members WHERE user_id=?", (uid,)); r = cur.fetchone()
-    return r[0] if r else None
-
-def is_president(uid):
-    c = get_country_of(uid)
-    if not c: return False
-    co = get_country(c); return co and co[2] == uid
-def is_government(uid): return get_position(uid) in ('Президент','Министр','Генерал','Губернатор')
-
-def set_game_state(uid, game):
-    cur.execute("INSERT OR REPLACE INTO game_state(user_id,game,ts) VALUES(?,?,?)", (uid, game, int(time.time()))); conn.commit()
-def get_game_state(uid):
-    cur.execute("SELECT game,ts FROM game_state WHERE user_id=?", (uid,)); r = cur.fetchone()
-    if r and int(time.time()) - r[1] < 300: return r[0]
-    return None
-def clear_game_state(uid):
-    cur.execute("DELETE FROM game_state WHERE user_id=?", (uid,)); conn.commit()
-
-def add_exp(uid, amount):
-    get_user(uid)
-    cur.execute("UPDATE users SET exp = exp + ? WHERE user_id=?", (amount, uid))
-    e = uexp(uid); lv = ulevel(uid)
-    new_lv = min((e or 0) // 100, 999)
-    if new_lv > (lv or 0):
-        cur.execute("UPDATE users SET level=? WHERE user_id=?", (new_lv, uid)); conn.commit()
-        return new_lv
-    conn.commit(); return None
-
-def gen_password():
-    return ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=8))
-
-# ============ VK ============
-try:
-    log("📡 VK сессия...")
-    vk_session = vk_api.VkApi(token=TOKEN)
-    vk = vk_session.get_api()
-    try:
-        info = vk.groups.getById(group_id=GROUP_ID)
-        log(f"✅ Группа: {info[0]['name']}")
-    except Exception as e:
-        log(f"❌ {type(e).__name__}: {e}"); raise SystemExit(1)
-    longpoll = VkBotLongPoll(vk_session, GROUP_ID)
-    log("✅ Long Poll готов")
-except Exception as e:
-    log(f"❌ VK: {e}"); traceback.print_exc(file=sys.stdout); raise SystemExit(1)
-
-def send(peer_id, text, keyboard=None, attachment=None):
-    if peer_id >= 2000000000: keyboard = None
-    try:
-        kw = {"peer_id": peer_id, "message": text, "random_id": get_random_id(), "keyboard": keyboard}
-        if attachment: kw["attachment"] = attachment
-        vk.messages.send(**kw)
-    except Exception as e: log(f"❌ Send: {e}")
-
-def send_uid(user_id, text, keyboard=None):
-    try: vk.messages.send(user_id=user_id, message=text, random_id=get_random_id(), keyboard=keyboard)
-    except Exception as e: log(f"❌ SendUID: {e}")
-
-def delete_message(peer_id, mid):
-    try: vk.messages.delete(message_ids=mid, delete_for_all=1); return True
-    except: return False
-
-def kick_user(chat_id, user_id):
-    try: vk.messages.removeChatUser(chat_id=chat_id, user_id=user_id); return True
-    except Exception as e: log(f"❌ Kick: {e}"); return False
-
-def get_chat_members(chat_id):
-    try:
-        r = vk.messages.getConversationMembers(peer_id=2000000000+chat_id)
-        return [m['member_id'] for m in r.get('items', []) if m.get('member_id', 0) > 0]
-    except: return []
-
-def get_report_chat():
-    cur.execute("SELECT peer_id FROM report_chats ORDER BY linked_at DESC LIMIT 1")
-    r = cur.fetchone()
-    return r[0] if r else None
-
-# ============ КЛАВИАТУРЫ ============
-def header(t):
-    cfg = style_cfg(); div = cfg["div"] * 16
-    return f"{div}\n     {cfg['emoji']} {t} {cfg['emoji']}\n{div}"
-
-def card(title, rows, footer=None):
-    txt = header(title) + "\n"
-    for k, v in rows: txt += f"  {k} ➜ {v}\n"
-    txt += style_div()
-    if footer: txt += f"\n{footer}"
-    return txt
-
-def kb(btns): return json.dumps({"one_time": False, "buttons": btns}, ensure_ascii=False)
-def kbc(label, cmd, color="primary"):
-    return {"action":{"type":"callback","label":label,"payload":json.dumps({"cmd":cmd})},"color":color}
-def kbt(label, cmd, color="primary"):
-    return {"action":{"type":"text","label":label,"payload":json.dumps({"cmd":cmd})},"color":color}
-
-def kb_main():
-    return kb([
-        [kbt("💰 Баланс","/баланс","positive"), kbt("🏦 Банк","/банк","positive")],
-        [kbt("🎰 Клуб","/клуб"), kbt("🎲 Казино","/казино")],
-        [kbt("🌍 Страна","/страна","secondary"), kbt("🏙 Города","/моигорода","secondary")],
-        [kbt("💼 Работы","/работы"), kbt("🏢 Бизнесы","/списокбиз")],
-        [kbt("🏆 Уровень","/уровень","positive"), kbt("🎖️ Титул","/мтитул","primary")],
-        [kbt("📢 Пиар","/пиар","positive"), kbt("🆘 Помощь","/help","secondary")],
-    ])
-
-def kb_games():
-    return kb([
-        [kbc("🎰 Казино","/казино"), kbc("🪙 Монетка","/монетка")],
-        [kbc("🎲 Кубик","/кубик"), kbc("🍒 Слоты","/слоты")],
-        [kbc("🎡 Рулетка","/рулетка"), kbc("🎯 Дартс","/дартс")],
-        [kbc("🚀 Краш","/краш"), kbc("🃏 Блэкджек","/блэкджек")],
-        [kbc("💣 Мины","/мины"), kbc("🎁 Кейс","/кейс")],
-        [kbc("🏗 Башня","/башня"), kbc("🏎 Гонка","/гонка")],
-        [kbc("🎣 Рыбалка","/рыбалка"), kbc("◀️ Меню","/меню","secondary")],
-    ])
-
-def kb_country():
-    return kb([
-        [kbt("🌍 Страны","/страны","primary"), kbt("🏙 Мои города","/моигорода","primary")],
-        [kbt("🏛 Казна","/казна","secondary"), kbt("🎖️ Армия","/армия","secondary")],
-        [kbt("👥 Граждане","/граждане","secondary"), kbt("🛒 Купить город","/купитьгород","secondary")],
-        [kbt("🗺 Гос.команды","/госскоманды"), kbt("◀️ Меню","/меню","secondary")],
-    ])
-
-def kb_back(): return kb([[kbt("◀️ Меню","/меню","secondary")]])
-def kb_bank():
-    return kb([
-        [kbc("💵 Положить 1000","/положить 1000","positive"), kbc("💸 Снять 1000","/снять 1000","negative")],
-        [kbc("💰 Баланс","/баланс"), kbc("◀️ Меню","/меню","secondary")],
-    ])
-def kb_ticket(tid):
-    return kb([
-        [kbc("💬 Chat", f"/tk chat {tid}")],
-        [kbc("📨 Передать обращение", f"/tk forward {tid}")],
-        [kbc("📢 Позвать Директора", f"/tk director {tid}", "negative")],
-        [kbc("🔒 Закрыть тикет", f"/tk close {tid}", "negative")],
-        [kbc("🚫 Флуд", f"/tk flud {tid}", "negative")],
-    ])
-
-TRANSPORT_PRICE = {"грузовик":50000,"поезд":250000,"корабль":500000,"самолет":1000000}
-PRODUCTS = ("еда","оружие","ресурсы","топливо","деньги")
-BUILDINGS = {"ферма":100000,"завод":250000,"нефтевышка":300000,"казарма":200000,"радар":150000,"госпиталь":180000}
-
-GAMES_INFO = {
-    "/казино":("🎰","КАЗИНО","Испытай удачу!"),
-    "/монетка":("🪙","МОНЕТКА","Орёл или решка?"),
-    "/кубик":("🎲","КУБИК","Бросай кубик!"),
-    "/слоты":("🍒","СЛОТЫ","Собери 3 в ряд!"),
-    "/рулетка":("🎡","РУЛЕТКА","Крути колесо!"),
-    "/дартс":("🎯","ДАРТС","Попади в яблочко!"),
-    "/краш":("🚀","КРАШ","Успей забрать!"),
-    "/блэкджек":("🃏","БЛЭКДЖЕК","Набери 21!"),
-    "/мины":("💣","МИНЫ","Не подорвись!"),
-    "/кейс":("🎁","КЕЙС","Открой кейс!"),
-    "/колесо":("🎡","КОЛЕСО","Крути!"),
-    "/башня":("🏗","БАШНЯ","Строй выше!"),
-    "/гонка":("🏎","ГОНКА","Кто быстрее?"),
-    "/рыбалка":("🎣","РЫБАЛКА","Поймай рыбку!"),
-}
-
-TEXT_ALIASES = {
-    "💰 баланс":"/баланс","🏦 банк":"/банк","🏆 топ":"/топ","🎰 клуб":"/клуб","🎲 казино":"/казино",
-    "🌍 страна":"/страна","📘 паспорт":"/паспорт","🎁 приз":"/приз","📋 задания":"/задания",
-    "⚔️ войны":"/войны","◀️ меню":"/меню","🎖️ титул":"/мтитул","📢 пиар":"/пиар",
-    "🎰 казино":"/казино","🪙 монетка":"/монетка","🎲 кубик":"/кубик","🍒 слоты":"/слоты",
-    "💼 работы":"/работы","🏢 бизнесы":"/списокбиз","🏆 уровень":"/уровень",
-    "📊 стата":"/стата","🆘 помощь":"/help","🏙 города":"/моигорода",
-                                               }
-# ============ ИГРЫ ============
+    # ============ ИГРЫ ============
 def play_game(peer_id, uid, game, bet):
     if bet <= 0: return send(peer_id, "❌ Ставка > 0")
     if get_balance(uid) < bet: return send(peer_id, f"❌ Мало!\n💳 {fmt(get_balance(uid))} 💵")
@@ -760,6 +430,7 @@ def build_help_user():
 🏙 ГОРОДА
   /моигорода /город <название> /собрать_город <название>
   /купитьгород <название> <цена> /построить_город <название>
+  /налёт <город> — грабёж чужого города (50 000 💵, 40%)
 
 🌍 СТРАНА
   /страны /паспорт /казна /граждане /армия /города
@@ -767,6 +438,10 @@ def build_help_user():
 📢 СОЦИАЛЬНОЕ
   /пиар /pr_my /promo /подписка /донат
   /report /offer /ивент /мафия /ежедневно
+
+🏆 ТОПЫ
+  /топ баланс | /топ сообщения | /топ маты
+  /топ захваты | /топ уровень
 
 🚪 /q
 🆘 /help
@@ -787,6 +462,7 @@ def build_help_admin():
 📩 ТИКЕТЫ
   /tickets /adt <номер> <ответ>
 
+📊 /мойстат — моя статистика
 🎁 /раздача
 👑 /adminpanel <пароль>
 📖 /ahelp
@@ -814,6 +490,7 @@ def build_help_owner():
 🌍 /удалитьстрану /улучшить_страну
 ⚔️ /война /захват /мир /запуск /дрон
 
+📊 /мойстат — моя статистика
 🔐 /adminpa
 📖 /ghelp
 {style_div()}"""
@@ -874,7 +551,90 @@ def handle_ticket_action(cmd):
         cur.execute("UPDATE tickets SET status='closed' WHERE id=?", (tid,)); conn.commit()
         return "🚫 Флуд"
     return None
-    # ============ ОСНОВНОЙ ОБРАБОТЧИК ============
+
+# ============ НАЛЁТ ============
+def do_raid(peer_id, uid, city_name):
+    last = ufield(uid, "raid_last", 0) or 0
+    now = int(time.time())
+    left = RAID_COOLDOWN - (now - last)
+    if left > 0:
+        return send(peer_id, f"⏳ Повторный налёт через {time_left_fmt(left)}")
+
+    cur.execute("SELECT id,name,country,income,owner,is_capital FROM cities WHERE LOWER(name)=LOWER(?)", (city_name,))
+    c = cur.fetchone()
+    if not c:
+        return send(peer_id, f"❌ Город «{city_name}» не найден")
+    cid, cn, cc, inc, cowner, cap = c
+
+    if cowner == uid:
+        return send(peer_id, "❌ Нельзя грабить собственный город")
+
+    if get_balance(uid) < RAID_COST:
+        return send(peer_id, f"❌ Нужно {fmt(RAID_COST)} 💵 на балансе\n💳 У тебя: {fmt(get_balance(uid))} 💵")
+
+    upd_balance(uid, -RAID_COST)
+    cur.execute("UPDATE users SET raid_last=? WHERE user_id=?", (now, uid)); conn.commit()
+
+    cfg = style_cfg()
+    cur.execute("SELECT flag FROM countries WHERE name=?", (cc,)); cf = cur.fetchone()
+    flag = cf[0] if cf else "🏳️"
+
+    success = random.random() < RAID_SUCCESS_CHANCE
+    tbonus, _ = get_title_bonus(uid)
+    sbonus = style_bonus()
+
+    if not success:
+        send(peer_id,
+            f"{style_div()}\n     💥 НАЛЁТ ПРОВАЛЕН\n{style_div()}\n\n"
+            f"  🏙 {flag} {cn} ({cc})\n"
+            f"  💸 Затраты: -{fmt(RAID_COST)} 💵\n"
+            f"  💳 Баланс: {fmt(get_balance(uid))} 💵\n\n"
+            f"  🚨 Охрана отбила атаку!\n\n{style_div()}")
+        if cowner:
+            try:
+                send_uid(cowner, f"🚨 Попытка налёта на ваш город {flag} {cn}!\n👤 Нападавший: {mention(uid)}")
+            except: pass
+        return
+
+    base_loot = int(inc * 0.20)
+    want_loot = int(base_loot * tbonus * sbonus)
+
+    taken = 0
+    if cowner:
+        owner_bank = get_bank(cowner)
+        if owner_bank >= want_loot:
+            upd_bank(cowner, -want_loot); taken = want_loot
+        else:
+            upd_bank(cowner, -owner_bank); taken = max(0, owner_bank)
+    else:
+        taken = want_loot
+
+    upd_balance(uid, taken)
+
+    bt = ""
+    if tbonus > 1.0 or sbonus > 1.0:
+        parts = []
+        if tbonus > 1.0: parts.append(f"титул ×{tbonus}")
+        if sbonus > 1.0: parts.append(f"стиль ×{sbonus}")
+        bt = f"\n  🎖️ Бонусы: {', '.join(parts)}"
+
+    send(peer_id,
+        f"{style_div()}\n     🏴 НАЛЁТ УСПЕШЕН\n{style_div()}\n\n"
+        f"  🏙 {flag} {cn} ({cc})\n"
+        f"  💰 Доход города: {fmt(inc)} 💵/24ч\n"
+        f"  💸 Затраты: -{fmt(RAID_COST)} 💵\n"
+        f"  🏆 Добыча: +{fmt(taken)} 💵{bt}\n"
+        f"  💳 Баланс: {fmt(get_balance(uid))} 💵\n\n"
+        f"  🔥 {cfg['emoji']} Город разграблен! {cfg['emoji']}\n{style_div()}")
+
+    if cowner:
+        try:
+            send_uid(cowner,
+                f"🏴 Ваш город {flag} {cn} ограблен!\n"
+                f"👤 Нападавший: {mention(uid)}\n"
+                f"💸 Потеряно: {fmt(taken)} 💵")
+        except: pass
+            # ============ ОСНОВНОЙ ОБРАБОТЧИК ============
 def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     text = text.strip(); low = text.lower()
     if low in TEXT_ALIASES: text = TEXT_ALIASES[low]
@@ -910,6 +670,14 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             send(peer_id, f"✅ Пиар #{oid} → {sent} чатов\n⏳ {dtxt}")
             send_uid(o[0], f"✅ Пиар #{oid} разослан\n⏳ {dtxt}")
         return
+
+    # СЧЁТЧИКИ СООБЩЕНИЙ И МАТА
+    if not text.startswith("/") and len(text) >= 2:
+        if has_mat(text):
+            cur.execute("UPDATE users SET msg_count=msg_count+1, mat_count=mat_count+1 WHERE user_id=?", (uid,))
+        else:
+            cur.execute("UPDATE users SET msg_count=msg_count+1 WHERE user_id=?", (uid,))
+        conn.commit()
 
     # EXP за сообщения
     wc = len(text.split())
@@ -967,7 +735,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if res: send(peer_id, res)
         return
 
-    # ПИАР
+    # ============ ПИАР ============
     if cmd in ("/пиар","/pr"):
         cur.execute("SELECT name, price, duration, description FROM pr_tariffs ORDER BY price")
         rows = cur.fetchall()
@@ -1053,7 +821,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         r = cur.fetchone()
         send(peer_id, card("📊 ПИАР", [("📢",str(r[0] or 0)),("💰",f"{fmt(r[1] or 0)} ₽")])); return
 
-    # ПАРОЛЬ
+    # ============ ПАРОЛЬ ============
     if cmd in ("/pass","/пароль"):
         pw = get_password(uid)
         return send(peer_id, f"🔑 `{pw}`\n/adminpanel {pw}" if pw else "❌ Нет пароля")
@@ -1064,16 +832,60 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not pdb: return
         if pdb != pw: return send(peer_id, "❌ Неверный пароль")
         p = get_priority(uid)
-        cur.execute("SELECT COUNT(*) FROM tickets WHERE answered_by=?", (uid,)); ta = cur.fetchone()[0] or 0
-        cur.execute("SELECT COUNT(*) FROM tickets WHERE answered_by=? AND status='closed'", (uid,)); tc = cur.fetchone()[0] or 0
-        if p >= 80: cmds = build_help_owner(); rk = "👑"
-        elif p >= 40: cmds = build_help_admin(); rk = "🛡"
-        elif p >= 10: cmds = build_help_admin(); rk = "🔨"
-        elif p >= 4: cmds = build_help_admin(); rk = "🎯"
+        if p >= 80: cmds = build_help_owner(); rk = "👑 ВЛАДЕЛЕЦ"
+        elif p >= 40: cmds = build_help_admin(); rk = "🛡 АДМИН"
+        elif p >= 10: cmds = build_help_admin(); rk = "🔨 МОДЕРАТОР"
+        elif p >= 4: cmds = build_help_admin(); rk = "🎯 СТАФФ"
         else: return send(peer_id, "❌ Нет прав")
-        st = f"{header('АДМИН-ПАНЕЛЬ')}\n\n  👤 {name_of(uid)}\n  🎭 {rk}\n  📊 {p}/101\n  🎨 {style_name()}\n\n  📩 {tc}/{ta}\n\n  ⏰ {datetime.now().strftime('%d.%m.%Y %H:%M')}\n{style_div()}\n\n"
-        send(uid, st + cmds)
-        send(peer_id, "✅ В личке!"); return
+
+        stats = get_admin_stats(uid)
+        s_bans, s_mutes, s_warns, s_reports, s_offers, s_tickets = stats
+        now_str = datetime.now().strftime('%d.%m.%Y %H:%M')
+
+        header_txt = (
+            f"{header('АДМИН-ПАНЕЛЬ')}\n\n"
+            f"  👤 {name_of(uid)}\n"
+            f"  🎭 {rk}\n"
+            f"  📊 Приоритет: {p}/101\n"
+            f"  🎨 Стиль: {style_name()} {style_emoji()}\n"
+            f"  ⏰ {now_str}\n"
+            f"{style_div()}\n"
+        )
+        stats_txt = (
+            f"\n{header('📊 МОЯ СТАТИСТИКА')}\n\n"
+            f"  🚫 Банов выдано: {fmt(s_bans)}\n"
+            f"  🔇 Мутов выдано: {fmt(s_mutes)}\n"
+            f"  ⚠️ Варнов выдано: {fmt(s_warns)}\n"
+            f"  ─────────────────────\n"
+            f"  📩 Жалоб/вопросов: {fmt(s_reports)}\n"
+            f"  💡 Идей принято: {fmt(s_offers)}\n"
+            f"  🎫 Всего тикетов: {fmt(s_tickets)}\n"
+            f"{style_div()}\n"
+        )
+        cmds_txt = f"\n{header('🛠 ДОСТУПНЫЕ КОМАНДЫ')}\n\n{cmds}"
+        try:
+            send_uid(uid, header_txt + stats_txt + cmds_txt, kb_back())
+            send(peer_id, "✅ Всё отправил в личку!")
+        except Exception as e:
+            log(f"❌ adminpanel: {e}")
+            send(peer_id, "❌ Не смог отправить в ЛС (открой личку)")
+        return
+
+    if cmd == "/мойстат":
+        p = get_priority(uid)
+        if p < 4: return send(peer_id, "❌ Только для стаффа (4+)")
+        s_bans, s_mutes, s_warns, s_reports, s_offers, s_tickets = get_admin_stats(uid)
+        send(peer_id, f"{header('📊 МОЯ СТАТИСТИКА')}\n\n"
+                      f"  👤 {name_of(uid)}\n"
+                      f"  📊 Приоритет: {p}/101\n\n"
+                      f"  🚫 Банов: {fmt(s_bans)}\n"
+                      f"  🔇 Мутов: {fmt(s_mutes)}\n"
+                      f"  ⚠️ Варнов: {fmt(s_warns)}\n"
+                      f"  📩 Жалоб/вопросов: {fmt(s_reports)}\n"
+                      f"  💡 Идей: {fmt(s_offers)}\n"
+                      f"  🎫 Всего тикетов: {fmt(s_tickets)}\n"
+                      f"{style_div()}", kb_back())
+        return
 
     if cmd == "/adminpa":
         if uid != MAIN_OWNER: return
@@ -1084,7 +896,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for tu,pr,pw in rows: txt += f"  🎭 {name_of(tu)}\n     🆔 id{tu}\n     📊 {pr}\n     🔑 `{pw}`\n\n"
         send(peer_id, txt + f"{style_div()}"); return
 
-    # СТИЛЬ
+    # ============ СТИЛЬ ============
     if cmd in ("/стиль","/style"):
         if len(args) < 2:
             txt = f"{header('🎨 СТИЛИ')}\n\n  🎯 {style_name()} {style_emoji()}\n  🎁 ×{style_bonus()}\n\n"
@@ -1101,7 +913,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         set_style(ns); cfg = STYLES[ns]
         send(peer_id, f"{style_div()}\n     {cfg['emoji']} СТИЛЬ ИЗМЕНЁН\n{style_div()}\n\n  🎨 {cfg['name']}\n  🎁 ×{cfg['bonus']}\n  👤 {mention(uid)}\n\n{style_div()}"); return
 
-    # БАНК
+    # ============ БАНК ============
     if cmd == "/банк":
         bank = get_bank(uid); bal = get_balance(uid)
         send(peer_id, f"{header('🏦 БАНК')}\n\n  👤 {name_of(uid)}\n\n  💰 Баланс: {fmt(bal)} 💵\n  🏦 Счёт: {fmt(bank)} 💵\n  📊 Всего: {fmt(bal+bank)} 💵\n\n  📈 Доход с бизнеса идёт сюда!\n\n{style_div()}\n📝 /положить | /снять", kb_bank()); return
@@ -1166,7 +978,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         now = int(time.time()); left = 86400 - (now - (lc or 0))
         if left > 0:
             return send(peer_id, f"⏳ Через {time_left_fmt(left)}")
-        # 5% идёт в казну страны, 95% в банк
         treasury_share = int(inc * 0.05)
         bank_share = inc - treasury_share
         upd_bank(uid, bank_share)
@@ -1181,7 +992,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     if cmd == "/купитьгород":
         if len(args) < 3: return send(peer_id, "📝 /купитьгород <название> <цена>")
-        name = " ".join(args[1:-1]); 
+        name = " ".join(args[1:-1])
         try: price = int(args[-1])
         except: return
         if price < 1000: return send(peer_id, "❌ Мин. цена 1000")
@@ -1209,8 +1020,15 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("UPDATE cities SET level=level+1, population=population+5000, income=income+2000, defense=defense+500 WHERE id=?", (cid,))
         conn.commit()
         send(peer_id, f"🏗 {name} прокачан до ур. {lv+1}", kb_country()); return
-        
-    # REPORT/OFFER
+
+    # ============ НАЛЁТ ============
+    if cmd in ("/налёт","/налет"):
+        if len(args) < 2:
+            return send(peer_id, f"📝 /налёт <название города>\n\n  💰 Стоимость: {fmt(RAID_COST)} 💵\n  🎯 Шанс успеха: 40%\n  🏆 Добыча: 20% от дохода города\n  ⏳ Кулдаун: 1 час", kb_country())
+        city_name = " ".join(args[1:])
+        return do_raid(peer_id, uid, city_name)
+
+    # ============ REPORT/OFFER ============
     if cmd == "/report":
         if len(args) < 2: return send(peer_id, "📝 /report <текст>")
         tm = " ".join(args[1:])
@@ -1254,10 +1072,13 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         try: tid = int(args[1])
         except: return
         ans = " ".join(args[2:])
-        cur.execute("SELECT user_id FROM tickets WHERE id=?", (tid,)); t = cur.fetchone()
+        cur.execute("SELECT user_id, type FROM tickets WHERE id=?", (tid,)); t = cur.fetchone()
         if not t: return
         cur.execute("UPDATE tickets SET status='closed', answer=?, answered_by=? WHERE id=?",
                     (ans, uid, tid)); conn.commit()
+        inc_admin_stat(uid, "tickets")
+        if t[1] == "report": inc_admin_stat(uid, "reports")
+        elif t[1] == "offer": inc_admin_stat(uid, "offers")
         send_uid(t[0], f"📩 ОТВЕТ #{tid}\n\n{ans}"); send(peer_id, "✅"); return
 
     if cmd == "/build":
@@ -1280,7 +1101,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
                     (chat_id,peer_id,title,"chat",uid,int(time.time()))); conn.commit()
         send(peer_id, f"✅ {title}"); return
 
-    # ТИШИНА
+    # ============ ТИШИНА ============
     if cmd == "/тишина":
         if not is_admin(uid) or not chat_id: return
         if len(args) < 2: return send(peer_id, "📝 /тишина <0-101|выкл>")
@@ -1292,7 +1113,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("INSERT OR REPLACE INTO chat_silence(chat_id,min_priority) VALUES(?,?)", (chat_id, p)); conn.commit()
         send(peer_id, f"🤫 {p}+"); return
 
-    # ИГРЫ
+    # ============ ИГРЫ ============
     if cmd in GAMES_INFO:
         if len(args) < 2:
             set_game_state(uid, cmd); emoji, name, desc = GAMES_INFO[cmd]
@@ -1301,6 +1122,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: return
         play_game(peer_id, uid, cmd, bet); return
 
+    # ============ БАЛАНС / УРОВЕНЬ ============
     if cmd in ("/баланс","баланс"):
         send(peer_id, card("БАЛАНС", [
             ("👤",name_of(uid)),("💰",f"{fmt(get_balance(uid))} 💵"),
@@ -1312,13 +1134,56 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         lv = ulevel(uid); e = uexp(uid); need = (lv+1)*100
         send(peer_id, card("УРОВЕНЬ", [("📊",str(lv)),("⚡",f"{e} exp"),("📈 До след.",f"{max(0,need-e)}")]), kb_back()); return
 
+    # ============ ТОПЫ ============
     if cmd in ("/топ","топ"):
-        cur.execute("SELECT user_id,balance+bank FROM users ORDER BY balance+bank DESC LIMIT 10")
-        rows = cur.fetchall(); m = ["🥇","🥈","🥉"] + ["🔹"]*7
-        txt = header("ТОП-10")+"\n\n"
-        for i,(u,b) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(b)} 💵\n"
+        cat = args[1].lower() if len(args) > 1 else "баланс"
+        m = ["🥇","🥈","🥉"] + ["🔹"]*7
+
+        if cat in ("баланс","balance","деньги","💰"):
+            cur.execute("SELECT user_id,balance+bank FROM users ORDER BY balance+bank DESC LIMIT 10")
+            rows = cur.fetchall()
+            txt = header("💰 ТОП-10 ПО БАЛАНСУ")+"\n\n"
+            for i,(u,b) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(b)} 💵\n"
+
+        elif cat in ("сообщения","сообщение","msg","💬"):
+            cur.execute("SELECT user_id,msg_count FROM users WHERE msg_count>0 ORDER BY msg_count DESC LIMIT 10")
+            rows = cur.fetchall()
+            txt = header("💬 ТОП-10 ПО СООБЩЕНИЯМ")+"\n\n"
+            for i,(u,c) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(c)} сообщ.\n"
+            if not rows: txt += "  ❌ Пока никто не писал\n"
+
+        elif cat in ("маты","мат","матюки","🤬"):
+            cur.execute("SELECT user_id,mat_count FROM users WHERE mat_count>0 ORDER BY mat_count DESC LIMIT 10")
+            rows = cur.fetchall()
+            txt = header("🤬 ТОП-10 ПО МАТАМ")+"\n\n"
+            for i,(u,c) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(c)} раз\n"
+            if not rows: txt += "  😇 Никто не матерился\n"
+
+        elif cat in ("захваты","захват","войны","⚔️"):
+            cur.execute("SELECT user_id,captures FROM users WHERE captures>0 ORDER BY captures DESC LIMIT 10")
+            rows = cur.fetchall()
+            txt = header("⚔️ ТОП-10 ПО ЗАХВАТАМ")+"\n\n"
+            for i,(u,c) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(c)} стран\n"
+            if not rows: txt += "  ⚪ Пока никто не захватывал страны\n"
+
+        elif cat in ("уровень","уровню","exp","lvl","🏆"):
+            cur.execute("SELECT user_id,level,exp FROM users ORDER BY level DESC, exp DESC LIMIT 10")
+            rows = cur.fetchall()
+            txt = header("🏆 ТОП-10 ПО УРОВНЮ")+"\n\n"
+            for i,(u,l,e) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — ур. {l} ({fmt(e)} exp)\n"
+
+        else:
+            txt = (f"{header('🏆 ТОПЫ')}\n\n"
+                   f"  💰 /топ баланс\n"
+                   f"  💬 /топ сообщения\n"
+                   f"  🤬 /топ маты\n"
+                   f"  ⚔️ /топ захваты\n"
+                   f"  🏆 /топ уровень\n"
+                   f"{style_div()}")
+
         send(peer_id, txt + f"\n{style_div()}", kb_back()); return
 
+    # ============ ПРИЗ / ЕЖЕДНЕВНО ============
     if cmd in ("/приз","приз"):
         last = ulast_bonus(uid) or 0
         left = 86400 - (int(time.time()) - last)
@@ -1361,7 +1226,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: send(peer_id, f"📰 https://vk.com/club{GROUP_ID}")
         return
 
-    # РАБОТЫ
+    # ============ РАБОТЫ ============
     if cmd == "/работы":
         cur.execute("SELECT name,salary,exp,min_exp FROM jobs ORDER BY min_exp"); rows = cur.fetchall()
         e = uexp(uid); bonus = round(get_title_bonus(uid)[0] * style_bonus(), 2)
@@ -1404,7 +1269,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if nlv: txt += f"\n🎉 Ур. {nlv}!"
         send(peer_id, txt + f"\n{style_div()}"); return
 
-    # БИЗНЕС
+    # ============ БИЗНЕС ============
     if cmd in ("/списокбиз","/бизнесы","/биз"):
         p = 0
         if len(args) >= 2:
@@ -1445,7 +1310,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for n,i in rows: txt += f"  • {n} — {fmt(i)} 💵\n"; t += i
         send(peer_id, txt + f"\n  🏦 {fmt(t)} 💵\n{style_div()}"); return
 
-    # СТРАНЫ
+    # ============ СТРАНЫ ============
     if cmd in ("/страны","/страна"):
         cur.execute("SELECT name,flag,treasury,army,cities,president FROM countries WHERE alive=1 ORDER BY cities DESC")
         rows = cur.fetchall()
@@ -1503,16 +1368,18 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         else: send(peer_id, f"📊 {cmd}: доступно", kb_country())
         return
 
-    # МОДЕРАЦИЯ
+    # ============ МОДЕРАЦИЯ ============
     if cmd == "/warn":
         if not is_admin(uid): return
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t or is_owner(t) or is_admin(t): return
         get_user(t); cur.execute("UPDATE users SET warns=warns+1 WHERE user_id=?", (t,)); conn.commit()
         cur.execute("SELECT warns FROM users WHERE user_id=?", (t,)); w = cur.fetchone()[0]
+        inc_admin_stat(uid, "warns")
         if w >= 3:
             cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t,"3 варна")); conn.commit()
             if chat_id: kick_user(chat_id, t)
+            inc_admin_stat(uid, "bans")
             send(peer_id, f"🚫 {mention(t)} автобан")
         else: send(peer_id, f"⚠️ {w}/3 для {mention(t)}")
         return
@@ -1533,6 +1400,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         reason = " ".join(args[3:]) if len(args) > 3 else "не указана"
         get_user(t); until = int(time.time()) + m*60
         cur.execute("UPDATE users SET mute_until=? WHERE user_id=?", (until, t)); conn.commit()
+        inc_admin_stat(uid, "mutes")
         dt = datetime.fromtimestamp(until).strftime("%d.%m.%Y %H:%M")
         cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); ar = cur.fetchone()
         an = ar[0] if ar and ar[0] else f"id{uid}"
@@ -1561,6 +1429,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not t or is_owner(t) or is_admin(t): return
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
         cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t, reason)); conn.commit()
+        inc_admin_stat(uid, "bans")
         if chat_id: kick_user(chat_id, t)
         cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); ar = cur.fetchone()
         an = ar[0] if ar and ar[0] else f"id{uid}"
@@ -1580,6 +1449,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not t or t in OWNERS: return
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
         cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t, reason)); conn.commit()
+        inc_admin_stat(uid, "bans")
         kicked = 0
         cur.execute("SELECT chat_id FROM builds"); chats = cur.fetchall()
         for (cid,) in chats:
@@ -1597,7 +1467,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for u,r in rows: txt += f"  🚫 id{u} — {r}\n"
         send(peer_id, txt + f"\n{style_div()}"); return
 
-    # РОЛИ
+    # ============ РОЛИ ============
     if cmd == "/role":
         cur.execute("SELECT name,priority,emoji FROM roles ORDER BY priority DESC"); rows = cur.fetchall()
         txt = header("РОЛИ")+"\n\n"
@@ -1722,7 +1592,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             except: pass
         send(peer_id, f"📢 в {s}"); return
 
-    # ВЛАДЕЛЕЦ
+    # ============ ВЛАДЕЛЕЦ ============
     if cmd == "/обнулить":
         if not is_owner(uid) and not is_admin(uid): return
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
@@ -1735,7 +1605,8 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t or t in OWNERS: return
         cur.execute("""UPDATE users SET balance=0, bank=0, warns=0, role='user', country=NULL,
-                       priority=0, exp=0, level=0, work=NULL, password=NULL, title=NULL WHERE user_id=?""", (t,))
+                       priority=0, exp=0, level=0, work=NULL, password=NULL, title=NULL,
+                       msg_count=0, mat_count=0, captures=0 WHERE user_id=?""", (t,))
         for q in ["DELETE FROM user_roles WHERE user_id=?","DELETE FROM global_roles WHERE user_id=?",
                   "DELETE FROM companies WHERE owner=?","DELETE FROM nicks WHERE user_id=?",
                   "DELETE FROM members WHERE user_id=?"]:
@@ -1758,7 +1629,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: return
         upd_balance(t, -a); send(peer_id, f"✅ -{fmt(a)} 💵"); return
 
-    # ТИТУЛЫ
+    # ============ ТИТУЛЫ ============
     if cmd == "/мтитул":
         bonus, _ = get_title_bonus(uid)
         send(peer_id, card("МОЙ ТИТУЛ", [
@@ -1774,7 +1645,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("UPDATE users SET title=? WHERE user_id=?", (title, t)); conn.commit()
         send(peer_id, f"✅ {mention(t)}: {title}"); return
 
-    # ПРОМО
+    # ============ ПРОМО ============
     if cmd == "/promo":
         if len(args)<2: return
         code = args[1].upper()
@@ -1792,7 +1663,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("INSERT OR REPLACE INTO promos(code,amount,uses,max_uses) VALUES(?,?,0,?)", (code,a,u)); conn.commit()
         send(peer_id, f"🎟️ {code} создан"); return
 
-    # МАФИЯ
+    # ============ МАФИЯ ============
     if cmd in ("/ивент","/мафия"):
         if chat_id: mafia_new(peer_id, uid, chat_id); return
     if cmd == "/мафия_вступить":
@@ -1829,6 +1700,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, build_help_owner(), kb_back()); return
 
 
+# ============ ПАГИНАЦИЯ БИЗНЕСОВ ============
 def biz_page(peer_id, page):
     if page < 0: page = 0
     cur.execute("SELECT COUNT(*) FROM biz_types"); total = cur.fetchone()[0]
@@ -1920,4 +1792,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
