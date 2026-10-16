@@ -2,14 +2,14 @@
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.utils import get_random_id
-import sqlite3, random, time, json, os, sys, traceback
+import sqlite3, random, time, json, os, sys, traceback, threading
 from datetime import datetime
 
 def log(msg):
     print(msg, flush=True); sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
-# ВАЖНО: токен лучше держать в env-переменной VK_TOKEN на Bothost.
+# Токен лучше держать в env-переменной VK_TOKEN на Bothost.
 # FALLBACK_TOKEN — только для локального теста. Пустая строка = не используется.
 FALLBACK_TOKEN = ""
 
@@ -300,6 +300,8 @@ for t, c, d in [
     ("users","msg_count","INTEGER DEFAULT 0"),
     ("users","mat_count","INTEGER DEFAULT 0"),
     ("users","captures","INTEGER DEFAULT 0"),
+    ("pr_orders","interval_min","INTEGER DEFAULT 0"),
+    ("pr_orders","last_resend","INTEGER DEFAULT 0"),
 ]:
     _add_col(t, c, d)
     # ============ СТИЛЬ ============
@@ -632,7 +634,8 @@ def kb_main():
         [kbt("🏙 Города","/моигорода","secondary"), kbt("🏴 Налёт","/налёт","negative")],
         [kbt("💼 Работы","/работы"), kbt("🏢 Бизнесы","/списокбиз")],
         [kbt("🏆 Уровень","/уровень","positive"), kbt("🎖️ Титул","/мтитул","primary")],
-        [kbt("📢 Пиар","/пиар","positive"), kbt("🆘 Помощь","/help","secondary")],
+        [kbt("📢 Пиар","/пиар","positive"), kbt("🔁 Авто-пиар","/пиар_авто","positive")],
+        [kbt("🆘 Помощь","/help","secondary")],
         [kbt("📊 Моя стата","/мойстат","secondary")],
     ])
 
@@ -699,7 +702,7 @@ TEXT_ALIASES = {
     "🎰 казино":"/казино","🪙 монетка":"/монетка","🎲 кубик":"/кубик","🍒 слоты":"/слоты",
     "💼 работы":"/работы","🏢 бизнесы":"/списокбиз","🏆 уровень":"/уровень",
     "📊 стата":"/стата","🆘 помощь":"/help","🏙 города":"/моигорода",
-    }
+             }
 # ============ ИГРЫ ============
 def play_game(peer_id, uid, game, bet):
     if bet <= 0: return send(peer_id, "❌ Ставка > 0")
@@ -834,7 +837,7 @@ def build_help_user():
   /паспорт /казна /граждане /армия /города
 
 📢 СОЦИАЛЬНОЕ
-  /пиар /pr_my /promo /подписка /донат
+  /пиар /пиар_авто /pr_my /promo /подписка /донат
   /report /offer /ивент /мафия /ежедневно
 
 🏆 ТОПЫ
@@ -877,7 +880,7 @@ def build_help_owner():
 
 👑 УПРАВЛЕНИЕ
   /start /stop /объявление
-  /builds /build /build report
+  /builds /build /build report /build_piar
   /выдать /вернуть /обнулить /вайп
   /removestaff /setpass
 
@@ -1032,7 +1035,47 @@ def do_raid(peer_id, uid, city_name):
                 f"👤 Нападавший: {mention(uid)}\n"
                 f"💸 Потеряно: {fmt(taken)} 💵")
         except: pass
-            # ============ ОСНОВНОЙ ОБРАБОТЧИК ============
+
+# ============ АВТО-ПИАР ============
+def pr_auto_price(minutes):
+    """1 мин = 50₽, 2 мин = 55₽, ..., 20 мин = 145₽"""
+    return 45 + 5 * minutes
+
+def pr_send_to_piar_chats(body):
+    """Рассылка текста ТОЛЬКО в PIAR-чаты. Возвращает кол-во отправленных."""
+    pr_text = f"{style_div()}\n     📢 РЕКЛАМА\n{style_div()}\n\n{body}\n\n{style_div()}"
+    sent = 0
+    cur.execute("SELECT peer_id FROM builds WHERE UPPER(type)='PIAR'"); chats = cur.fetchall()
+    for (cp,) in chats:
+        try:
+            vk.messages.send(peer_id=cp, message=pr_text, random_id=get_random_id())
+            sent += 1; time.sleep(0.34)
+        except: pass
+    return sent
+
+def pr_resend_worker():
+    """Фоновый поток: каждые 30 сек проверяет, пора ли повторить авто-пиар."""
+    time.sleep(15)
+    while True:
+        try:
+            now = int(time.time())
+            cur.execute("""SELECT id,text,interval_min,last_resend
+                           FROM pr_orders
+                           WHERE status='sent' AND interval_min>0
+                             AND text IS NOT NULL AND text != ''""")
+            rows = cur.fetchall()
+            for oid, body, interval, last in rows:
+                if not interval or interval <= 0: continue
+                if now - (last or 0) < interval * 60: continue
+                sent = pr_send_to_piar_chats(body)
+                cur.execute("UPDATE pr_orders SET last_resend=?, sent_count=sent_count+? WHERE id=?",
+                            (now, sent, oid))
+                conn.commit()
+                log(f"🔁 Авто-пиар #{oid}: {sent} PIAR-чатов")
+        except Exception as e:
+            log(f"❌ pr_resend_worker: {e}")
+        time.sleep(30)
+        # ============ ОСНОВНОЙ ОБРАБОТЧИК ============
 def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     text = text.strip(); low = text.lower()
     if low in TEXT_ALIASES: text = TEXT_ALIASES[low]
@@ -1043,30 +1086,24 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         try: oid = int(gs_pr.split(":")[1])
         except: oid = 0
         clear_game_state(uid)
-        cur.execute("SELECT user_id,tariff,status,duration FROM pr_orders WHERE id=?", (oid,))
+        cur.execute("SELECT user_id,tariff,status,duration,interval_min FROM pr_orders WHERE id=?", (oid,))
         o = cur.fetchone()
         if o and o[2] == "confirmed":
-            duration = o[3] or 0; now = int(time.time())
+            duration = o[3] or 0
+            interval = o[4] or 0
+            now = int(time.time())
             expires = 0 if duration == 0 else now + duration
-            pr_text = f"{style_div()}\n     📢 РЕКЛАМА\n{style_div()}\n\n{text}\n\n{style_div()}"
-            sent = 0
-            cur.execute("SELECT peer_id FROM builds"); chats = cur.fetchall()
-            for (cp,) in chats:
-                try:
-                    vk.messages.send(peer_id=cp, message=pr_text, random_id=get_random_id())
-                    sent += 1; time.sleep(0.34)
-                except: pass
-            cur.execute("SELECT peer_id FROM report_chats"); rcs = cur.fetchall()
-            for (cp,) in rcs:
-                try:
-                    vk.messages.send(peer_id=cp, message=pr_text, random_id=get_random_id())
-                    sent += 1; time.sleep(0.34)
-                except: pass
-            cur.execute("UPDATE pr_orders SET status='sent', sent_at=?, sent_count=?, expires_at=? WHERE id=?",
-                        (now, sent, expires, oid)); conn.commit()
+            sent = pr_send_to_piar_chats(text)
+            cur.execute("""UPDATE pr_orders SET status='sent', sent_at=?, sent_count=?,
+                           expires_at=?, text=?, last_resend=? WHERE id=?""",
+                        (now, sent, expires, text, now, oid))
+            conn.commit()
             dtxt = "♾" if duration == 0 else time_left_fmt(duration)
-            send(peer_id, f"✅ Пиар #{oid} → {sent} чатов\n⏳ {dtxt}")
-            send_uid(o[0], f"✅ Пиар #{oid} разослан\n⏳ {dtxt}")
+            auto_txt = f"\n🔁 Авто-повтор: каждые {interval} мин" if interval else ""
+            send(peer_id, f"✅ Пиар #{oid} → {sent} PIAR-чатов\n⏳ {dtxt}{auto_txt}")
+            send_uid(o[0], f"✅ Пиар #{oid} разослан\n⏳ {dtxt}{auto_txt}")
+        else:
+            send(peer_id, "⚠️ Заказ не в статусе confirmed")
         return
 
     # СЧЁТЧИКИ СООБЩЕНИЙ И МАТА
@@ -1133,16 +1170,57 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if res: send(peer_id, res)
         return
 
+    # ============ АВТО-ПИАР ============
+    if cmd in ("/пиар_авто","/pr_auto"):
+        txt = f"{header('📢 АВТО-ПИАР')}\n\n  🤖 Рассылка в PIAR-чаты каждые N минут\n\n  💰 ПРАЙС:\n\n"
+        btns = []; row = []
+        for n in range(1, 21):
+            pr = pr_auto_price(n)
+            txt += f"  ⏱ {n} мин — {pr} ₽\n"
+            row.append(kbc(f"{n}м|{pr}₽", f"/pr_avto {n}", "primary"))
+            if len(row) == 5: btns.append(row); row = []
+        if row: btns.append(row)
+        btns.append([kbc("📋 Мои заказы","/pr_my","secondary")])
+        send(peer_id, txt + f"\n{style_div()}\n📝 @id{MAIN_OWNER}", kb(btns)); return
+
+    if cmd == "/pr_avto":
+        if len(args) < 2: return send(peer_id, "📝 /pr_avto <1-20>")
+        try: n = int(args[1])
+        except: return send(peer_id, "❌ Число 1-20")
+        if n < 1 or n > 20: return send(peer_id, "❌ Интервал 1-20 минут")
+        price = pr_auto_price(n)
+        cur.execute("""INSERT INTO pr_orders(user_id,tariff,price,status,created,duration,interval_min)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (uid, f"Авто {n} мин", price, "wait_pay", int(time.time()), 0, n))
+        conn.commit(); oid = cur.lastrowid
+        send(peer_id, card("📢 АВТО-ПИАР ЗАКАЗ", [
+            ("🔢",f"#{oid}"),("⏱ Интервал",f"каждые {n} мин"),
+            ("💰",f"{price} ₽"),("❓","🟡 Ожидает оплаты"),
+        ], f"💳 @id{MAIN_OWNER}"))
+        if peer_id >= 2000000000:
+            link = f"https://vk.com/im?sel=c{peer_id-2000000000}"
+        else:
+            link = f"https://vk.com/id{uid}"
+        notif = (f"📢 НОВЫЙ АВТО-ПИАР ЗАКАЗ #{oid}\n\n"
+                 f"  👤 Покупатель: {mention(uid)}\n"
+                 f"  🔗 Ссылка на чат: {link}\n"
+                 f"  ⏱ Интервал: каждые {n} мин\n"
+                 f"  💰 Сумма: {price} ₽\n\n"
+                 f"✅ /pr_ok {oid}\n❌ /pr_no {oid}")
+        for ow in OWNERS: send_uid(ow, notif)
+        return
+
     # ============ ПИАР ============
     if cmd in ("/пиар","/pr"):
         cur.execute("SELECT name, price, duration, description FROM pr_tariffs ORDER BY price")
         rows = cur.fetchall()
         if not rows: return send(peer_id, "❌ Тарифы не настроены")
-        txt = f"{header('📢 ПИАР')}\n\n  💰 Оплата через владельца\n\n  📋 ТАРИФЫ:\n\n"
+        txt = f"{header('📢 ПИАР')}\n\n  💰 Оплата через владельца\n  📢 Рассылка только в PIAR-чаты\n\n  📋 ТАРИФЫ:\n\n"
         btn = []
         for n, p, d, desc in rows:
             txt += f"  📦 {n} — {p} ₽\n     {desc}\n\n"
             btn.append([kbc(f"📦 {n} — {p} ₽", f"/pr_buy {n}", "primary")])
+        btn.append([kbc("🔁 Авто-пиар","/пиар_авто","positive")])
         btn.append([kbc("📋 Мои заказы","/pr_my","secondary")])
         send(peer_id, txt + f"{style_div()}\n📝 @id{MAIN_OWNER}", kb(btn)); return
 
@@ -1159,18 +1237,23 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, card("📢 ЗАКАЗ ПИАРА", [
             ("🔢",f"#{oid}"),("📦",t[0]),("💰",f"{t[1]} ₽"),("❓","🟡 Ожидает оплаты")
         ], f"💳 @id{MAIN_OWNER}"))
+        if peer_id >= 2000000000:
+            link = f"https://vk.com/im?sel=c{peer_id-2000000000}"
+        else:
+            link = f"https://vk.com/id{uid}"
         for ow in OWNERS:
-            send_uid(ow, f"📢 ЗАКАЗ #{oid}\n👤 {mention(uid)}\n📦 {t[0]}\n💰 {t[1]} ₽\n\n✅ /pr_ok {oid}\n❌ /pr_no {oid}")
+            send_uid(ow, f"📢 ЗАКАЗ #{oid}\n👤 {mention(uid)}\n🔗 {link}\n📦 {t[0]}\n💰 {t[1]} ₽\n\n✅ /pr_ok {oid}\n❌ /pr_no {oid}")
         return
 
     if cmd == "/pr_my":
-        cur.execute("SELECT id,tariff,price,status,expires_at FROM pr_orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,))
+        cur.execute("SELECT id,tariff,price,status,expires_at,interval_min FROM pr_orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,))
         rows = cur.fetchall()
         if not rows: return send(peer_id, "📋 Нет заказов")
         st = {"wait_pay":"🟡","paid":"🟢","confirmed":"🔵","sent":"✅","cancelled":"🔴"}
         txt = header("📋 МОИ ЗАКАЗЫ")+"\n\n"
-        for oid, tn, p, s, exp in rows:
+        for oid, tn, p, s, exp, interval in rows:
             txt += f"  {st.get(s,'?')} #{oid} — {tn} — {p} ₽\n"
+            if interval and interval > 0: txt += f"     🔁 каждые {interval} мин\n"
             if s == "sent" and exp and exp > int(time.time()):
                 txt += f"     ⏳ {time_left_fmt(exp-int(time.time()))}\n"
             elif s == "sent" and exp == 0:
@@ -1202,6 +1285,14 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("UPDATE pr_orders SET status='cancelled' WHERE id=?", (oid,)); conn.commit()
         send(peer_id, f"❌ #{oid} отменён")
         send_uid(o[0], f"❌ Заказ #{oid} отклонён"); return
+
+    if cmd == "/pr_stop":
+        if not is_owner(uid): return
+        if len(args) < 2: return
+        try: oid = int(args[1])
+        except: return
+        cur.execute("UPDATE pr_orders SET interval_min=0 WHERE id=?", (oid,)); conn.commit()
+        send(peer_id, f"⏹ Авто-повтор #{oid} остановлен"); return
 
     if cmd == "/pr_orders":
         if not is_owner(uid): return
@@ -1235,31 +1326,16 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         elif p >= 10: cmds = build_help_admin(); rk = "🔨 МОДЕРАТОР"
         elif p >= 4: cmds = build_help_admin(); rk = "🎯 СТАФФ"
         else: return send(peer_id, "❌ Нет прав")
-
-        stats = get_admin_stats(uid)
-        s_bans, s_mutes, s_warns, s_reports, s_offers, s_tickets = stats
+        s_bans, s_mutes, s_warns, s_reports, s_offers, s_tickets = get_admin_stats(uid)
         now_str = datetime.now().strftime('%d.%m.%Y %H:%M')
-
-        header_txt = (
-            f"{header('АДМИН-ПАНЕЛЬ')}\n\n"
-            f"  👤 {name_of(uid)}\n"
-            f"  🎭 {rk}\n"
-            f"  📊 Приоритет: {p}/101\n"
-            f"  🎨 Стиль: {style_name()} {style_emoji()}\n"
-            f"  ⏰ {now_str}\n"
-            f"{style_div()}\n"
-        )
-        stats_txt = (
-            f"\n{header('📊 МОЯ СТАТИСТИКА')}\n\n"
-            f"  🚫 Банов выдано: {fmt(s_bans)}\n"
-            f"  🔇 Мутов выдано: {fmt(s_mutes)}\n"
-            f"  ⚠️ Варнов выдано: {fmt(s_warns)}\n"
-            f"  ─────────────────────\n"
-            f"  📩 Жалоб/вопросов: {fmt(s_reports)}\n"
-            f"  💡 Идей принято: {fmt(s_offers)}\n"
-            f"  🎫 Всего тикетов: {fmt(s_tickets)}\n"
-            f"{style_div()}\n"
-        )
+        header_txt = (f"{header('АДМИН-ПАНЕЛЬ')}\n\n  👤 {name_of(uid)}\n  🎭 {rk}\n"
+                      f"  📊 Приоритет: {p}/101\n  🎨 Стиль: {style_name()} {style_emoji()}\n"
+                      f"  ⏰ {now_str}\n{style_div()}\n")
+        stats_txt = (f"\n{header('📊 МОЯ СТАТИСТИКА')}\n\n"
+                     f"  🚫 Банов выдано: {fmt(s_bans)}\n  🔇 Мутов выдано: {fmt(s_mutes)}\n"
+                     f"  ⚠️ Варнов выдано: {fmt(s_warns)}\n  ─────────────────────\n"
+                     f"  📩 Жалоб/вопросов: {fmt(s_reports)}\n  💡 Идей принято: {fmt(s_offers)}\n"
+                     f"  🎫 Всего тикетов: {fmt(s_tickets)}\n{style_div()}\n")
         cmds_txt = f"\n{header('🛠 ДОСТУПНЫЕ КОМАНДЫ')}\n\n{cmds}"
         try:
             send_uid(uid, header_txt + stats_txt + cmds_txt, kb_back())
@@ -1273,16 +1349,10 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         p = get_priority(uid)
         if p < 4: return send(peer_id, "❌ Только для стаффа (4+)")
         s_bans, s_mutes, s_warns, s_reports, s_offers, s_tickets = get_admin_stats(uid)
-        send(peer_id, f"{header('📊 МОЯ СТАТИСТИКА')}\n\n"
-                      f"  👤 {name_of(uid)}\n"
-                      f"  📊 Приоритет: {p}/101\n\n"
-                      f"  🚫 Банов: {fmt(s_bans)}\n"
-                      f"  🔇 Мутов: {fmt(s_mutes)}\n"
-                      f"  ⚠️ Варнов: {fmt(s_warns)}\n"
-                      f"  📩 Жалоб/вопросов: {fmt(s_reports)}\n"
-                      f"  💡 Идей: {fmt(s_offers)}\n"
-                      f"  🎫 Всего тикетов: {fmt(s_tickets)}\n"
-                      f"{style_div()}", kb_back())
+        send(peer_id, f"{header('📊 МОЯ СТАТИСТИКА')}\n\n  👤 {name_of(uid)}\n  📊 Приоритет: {p}/101\n\n"
+                      f"  🚫 Банов: {fmt(s_bans)}\n  🔇 Мутов: {fmt(s_mutes)}\n  ⚠️ Варнов: {fmt(s_warns)}\n"
+                      f"  📩 Жалоб/вопросов: {fmt(s_reports)}\n  💡 Идей: {fmt(s_offers)}\n"
+                      f"  🎫 Всего тикетов: {fmt(s_tickets)}\n{style_div()}", kb_back())
         return
 
     if cmd == "/adminpa":
@@ -1313,8 +1383,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     # ============ БАНК ============
     if cmd == "/банк":
-        bank = get_bank(uid); bal = get_balance(uid)
-        send(peer_id, f"{header('🏦 БАНК')}\n\n  👤 {name_of(uid)}\n\n  💰 Баланс: {fmt(bal)} 💵\n  🏦 Счёт: {fmt(bank)} 💵\n  📊 Всего: {fmt(bal+bank)} 💵\n\n  📈 Доход с бизнеса идёт сюда!\n\n{style_div()}\n📝 /положить | /снять", kb_bank()); return
+        send(peer_id, f"{header('🏦 БАНК')}\n\n  👤 {name_of(uid)}\n\n  💰 Баланс: {fmt(get_balance(uid))} 💵\n  🏦 Счёт: {fmt(get_bank(uid))} 💵\n  📊 Всего: {fmt(get_balance(uid)+get_bank(uid))} 💵\n\n  📈 Доход с бизнеса идёт сюда!\n\n{style_div()}\n📝 /положить | /снять", kb_bank()); return
 
     if cmd == "/положить":
         if len(args) < 2: return
@@ -1356,12 +1425,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("SELECT flag FROM countries WHERE name=?", (cc,)); cf = cur.fetchone()
         flag = cf[0] if cf else "🏳️"
         send(peer_id, card(f"🏙 {cn}", [
-            ("🌍",f"{flag} {cc}"),
-            ("👑 Капитал","Да" if cap else "Нет"),
-            ("📊 Уровень",str(lv)),
-            ("👥 Население",fmt(pop)),
-            ("💰 Доход",f"{fmt(inc)} 💵/24ч"),
-            ("🛡 Оборона",fmt(df)),
+            ("🌍",f"{flag} {cc}"),("👑 Капитал","Да" if cap else "Нет"),
+            ("📊 Уровень",str(lv)),("👥 Население",fmt(pop)),
+            ("💰 Доход",f"{fmt(inc)} 💵/24ч"),("🛡 Оборона",fmt(df)),
         ], "/моигорода"), kb_country()); return
 
     if cmd == "/собрать_город":
@@ -1374,17 +1440,13 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if ucountry(uid) != cc and not is_owner(uid):
             return send(peer_id, "❌ Город не вашей страны")
         now = int(time.time()); left = 86400 - (now - (lc or 0))
-        if left > 0:
-            return send(peer_id, f"⏳ Через {time_left_fmt(left)}")
-        treasury_share = int(inc * 0.05)
-        bank_share = inc - treasury_share
+        if left > 0: return send(peer_id, f"⏳ Через {time_left_fmt(left)}")
+        treasury_share = int(inc * 0.05); bank_share = inc - treasury_share
         upd_bank(uid, bank_share)
         cur.execute("UPDATE countries SET treasury=treasury+? WHERE name=?", (treasury_share, cc))
-        cur.execute("UPDATE cities SET last_collect=? WHERE id=?", (now, cid))
-        conn.commit()
+        cur.execute("UPDATE cities SET last_collect=? WHERE id=?", (now, cid)); conn.commit()
         send(peer_id, card(f"🏙 {cn}", [
-            ("💰 Доход",f"+{fmt(inc)} 💵"),
-            ("🏦 В банк",f"{fmt(bank_share)} 💵"),
+            ("💰 Доход",f"+{fmt(inc)} 💵"),("🏦 В банк",f"{fmt(bank_share)} 💵"),
             ("🏛 В казну",f"{fmt(treasury_share)} 💵"),
         ], "/моигорода"), kb_country()); return
 
@@ -1402,8 +1464,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         upd_bank(uid, -price)
         cur.execute("INSERT INTO cities(name,country,owner,is_capital) VALUES(?,?,?,0)", (name, c, uid))
         cur.execute("UPDATE countries SET cities=cities+1 WHERE name=?", (c,))
-        conn.commit()
-        send(peer_id, f"🏙 Город «{name}» куплен за {fmt(price)} 💵", kb_country()); return
+        conn.commit(); send(peer_id, f"🏙 Город «{name}» куплен за {fmt(price)} 💵", kb_country()); return
 
     if cmd == "/построить_город":
         if len(args) < 2: return send(peer_id, "📝 /построить_город <название>")
@@ -1416,15 +1477,13 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if get_bank(uid) < cost: return send(peer_id, f"❌ Нужно {fmt(cost)} 💵")
         upd_bank(uid, -cost)
         cur.execute("UPDATE cities SET level=level+1, population=population+5000, income=income+2000, defense=defense+500 WHERE id=?", (cid,))
-        conn.commit()
-        send(peer_id, f"🏗 {name} прокачан до ур. {lv+1}", kb_country()); return
+        conn.commit(); send(peer_id, f"🏗 {name} прокачан до ур. {lv+1}", kb_country()); return
 
     # ============ НАЛЁТ ============
     if cmd in ("/налёт","/налет"):
         if len(args) < 2:
             return send(peer_id, f"📝 /налёт <название города>\n\n  💰 Стоимость: {fmt(RAID_COST)} 💵\n  🎯 Шанс успеха: 40%\n  🏆 Добыча: 20% от дохода города\n  ⏳ Кулдаун: 1 час", kb_country())
-        city_name = " ".join(args[1:])
-        return do_raid(peer_id, uid, city_name)
+        return do_raid(peer_id, uid, " ".join(args[1:]))
 
     # ============ REPORT/OFFER ============
     if cmd == "/report":
@@ -1479,6 +1538,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         elif t[1] == "offer": inc_admin_stat(uid, "offers")
         send_uid(t[0], f"📩 ОТВЕТ #{tid}\n\n{ans}"); send(peer_id, "✅"); return
 
+    # ============ BUILD / BUILDS ============
     if cmd == "/build":
         if not is_owner(uid): return
         if len(args) >= 2 and args[1].lower() == "report":
@@ -1486,18 +1546,46 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             cur.execute("INSERT OR REPLACE INTO report_chats(peer_id,linked_by,linked_at) VALUES(?,?,?)",
                         (peer_id, uid, int(time.time()))); conn.commit()
             send(peer_id, "✅ Report-чат привязан"); return
-        cur.execute("SELECT chat_id,title,type FROM builds"); rows = cur.fetchall()
-        txt = header("ПРИВЯЗАННЫЕ")+"\n\n"
-        for c,t,tp in rows: txt += f"  🏛 {t} ({tp}, id {c})\n"
-        send(peer_id, txt + f"\n{style_div()}"); return
+        cur.execute("SELECT chat_id,title,type FROM builds ORDER BY type DESC, chat_id"); rows = cur.fetchall()
+        piar = [r for r in rows if (r[2] or "").upper() == "PIAR"]
+        other = [r for r in rows if (r[2] or "").upper() != "PIAR"]
+        txt = f"{header('ПРИВЯЗАННЫЕ ЧАТЫ')}\n\n  📢 PIAR ({len(piar)}):\n"
+        if piar:
+            for c,t,tp in piar: txt += f"     ✅ {t} (id {c})\n"
+        else:
+            txt += "     ❌ Нет — пиар некуда слать!\n"
+        txt += f"\n  🏛 Остальные ({len(other)}):\n"
+        for c,t,tp in other[:20]: txt += f"     • {t} (id {c})\n"
+        txt += f"\n{style_div()}\n📝 /build_piar — пометить текущий чат как PIAR"
+        send(peer_id, txt); return
 
     if cmd == "/builds":
         if not is_owner(uid): return
         if not chat_id: return
         title = " ".join(args[1:]) if len(args)>1 else f"Беседа {chat_id}"
+        btype = "PIAR" if title.strip().upper() == "PIAR" else "chat"
         cur.execute("INSERT OR REPLACE INTO builds(chat_id,peer_id,title,type,linked_by,linked_at) VALUES(?,?,?,?,?,?)",
-                    (chat_id,peer_id,title,"chat",uid,int(time.time()))); conn.commit()
-        send(peer_id, f"✅ {title}"); return
+                    (chat_id,peer_id,title,btype,uid,int(time.time()))); conn.commit()
+        if btype == "PIAR":
+            send(peer_id, f"✅ Чат помечен как 📢 PIAR\n📝 Теперь сюда пойдут все рассылки пиара")
+        else:
+            send(peer_id, f"✅ {title}")
+        return
+
+    if cmd == "/build_piar":
+        if not is_owner(uid): return
+        if not chat_id: return
+        cur.execute("INSERT OR REPLACE INTO builds(chat_id,peer_id,title,type,linked_by,linked_at) VALUES(?,?,?,?,?,?)",
+                    (chat_id, peer_id, "PIAR", "PIAR", uid, int(time.time()))); conn.commit()
+        send(peer_id, "✅ Этот чат помечен как 📢 PIAR\n📝 Все рассылки пиара пойдут сюда")
+        return
+
+    if cmd == "/unbuild_piar":
+        if not is_owner(uid): return
+        if not chat_id: return
+        cur.execute("UPDATE builds SET type='chat' WHERE chat_id=?", (chat_id,)); conn.commit()
+        send(peer_id, "🔕 Чат больше не PIAR")
+        return
 
     # ============ ТИШИНА ============
     if cmd == "/тишина":
@@ -1536,55 +1624,42 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd in ("/топ","топ"):
         cat = args[1].lower() if len(args) > 1 else "баланс"
         m = ["🥇","🥈","🥉"] + ["🔹"]*7
-
         if cat in ("баланс","balance","деньги","💰"):
             cur.execute("SELECT user_id,balance+bank FROM users ORDER BY balance+bank DESC LIMIT 10")
             rows = cur.fetchall()
             txt = header("💰 ТОП-10 ПО БАЛАНСУ")+"\n\n"
             for i,(u,b) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(b)} 💵\n"
-
         elif cat in ("сообщения","сообщение","msg","💬"):
             cur.execute("SELECT user_id,msg_count FROM users WHERE msg_count>0 ORDER BY msg_count DESC LIMIT 10")
             rows = cur.fetchall()
             txt = header("💬 ТОП-10 ПО СООБЩЕНИЯМ")+"\n\n"
             for i,(u,c) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(c)} сообщ.\n"
             if not rows: txt += "  ❌ Пока никто не писал\n"
-
         elif cat in ("маты","мат","матюки","🤬"):
             cur.execute("SELECT user_id,mat_count FROM users WHERE mat_count>0 ORDER BY mat_count DESC LIMIT 10")
             rows = cur.fetchall()
             txt = header("🤬 ТОП-10 ПО МАТАМ")+"\n\n"
             for i,(u,c) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(c)} раз\n"
             if not rows: txt += "  😇 Никто не матерился\n"
-
         elif cat in ("захваты","захват","войны","⚔️"):
             cur.execute("SELECT user_id,captures FROM users WHERE captures>0 ORDER BY captures DESC LIMIT 10")
             rows = cur.fetchall()
             txt = header("⚔️ ТОП-10 ПО ЗАХВАТАМ")+"\n\n"
             for i,(u,c) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — {fmt(c)} стран\n"
             if not rows: txt += "  ⚪ Пока никто не захватывал страны\n"
-
         elif cat in ("уровень","уровню","exp","lvl","🏆"):
             cur.execute("SELECT user_id,level,exp FROM users ORDER BY level DESC, exp DESC LIMIT 10")
             rows = cur.fetchall()
             txt = header("🏆 ТОП-10 ПО УРОВНЮ")+"\n\n"
             for i,(u,l,e) in enumerate(rows): txt += f"  {m[i]} {name_of(u)} — ур. {l} ({fmt(e)} exp)\n"
-
         else:
-            txt = (f"{header('🏆 ТОПЫ')}\n\n"
-                   f"  💰 /топ баланс\n"
-                   f"  💬 /топ сообщения\n"
-                   f"  🤬 /топ маты\n"
-                   f"  ⚔️ /топ захваты\n"
-                   f"  🏆 /топ уровень\n"
-                   f"{style_div()}")
-
+            txt = (f"{header('🏆 ТОПЫ')}\n\n  💰 /топ баланс\n  💬 /топ сообщения\n"
+                   f"  🤬 /топ маты\n  ⚔️ /топ захваты\n  🏆 /топ уровень\n{style_div()}")
         send(peer_id, txt + f"\n{style_div()}", kb_back()); return
 
-    # ============ ПРИЗ / ЕЖЕДНЕВНО ============
+    # ============ ПРИЗ / ЕЖЕДНЕВНО / ПЕРЕВОД ============
     if cmd in ("/приз","приз"):
-        last = ulast_bonus(uid) or 0
-        left = 86400 - (int(time.time()) - last)
+        last = ulast_bonus(uid) or 0; left = 86400 - (int(time.time()) - last)
         if left > 0:
             h = left//3600; m_ = (left%3600)//60
             return send(peer_id, f"⏳ Через {h}ч {m_}мин")
@@ -1593,7 +1668,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("UPDATE users SET last_bonus=? WHERE user_id=?", (int(time.time()), uid)); conn.commit()
         send(peer_id, f"🎁 +{fmt(amt)} 💵 | +5 exp\n⏰ Через 24ч"); return
 
-    if cmd == "/ежедневно" or cmd == "/daily":
+    if cmd in ("/ежедневно","/daily"):
         last = udaily(uid); now = int(time.time())
         if now - (last or 0) < 86400:
             left = 86400 - (now - (last or 0)); h = left//3600; m_ = (left%3600)//60
@@ -1713,20 +1788,15 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if len(args) < 2:
             c = ucountry(uid)
             if c:
-                co = get_country(c)
-                fl = co[1] if co else "🏳️"
-                return send(peer_id,
-                    card("🌍 ВАШЕ ГРАЖДАНСТВО", [
-                        ("👤", name_of(uid)),
-                        ("🌍", f"{fl} {c}"),
-                        ("💼", get_position(uid) or "Гражданин"),
-                    ], f"📝 Сменить: /гражданство <страна>"),
-                    kb_country())
+                co = get_country(c); fl = co[1] if co else "🏳️"
+                return send(peer_id, card("🌍 ВАШЕ ГРАЖДАНСТВО", [
+                    ("👤", name_of(uid)), ("🌍", f"{fl} {c}"),
+                    ("💼", get_position(uid) or "Гражданин"),
+                ], f"📝 Сменить: /гражданство <страна>"), kb_country())
             cur.execute("SELECT name,flag FROM countries WHERE alive=1 ORDER BY name")
             rows = cur.fetchall()
             txt = f"{header('🌍 ВЫБОР ГРАЖДАНСТВА')}\n\n  У тебя пока нет гражданства.\n\n"
-            for n,f in rows:
-                txt += f"  {f or '🏳️'} {n}\n"
+            for n,f in rows: txt += f"  {f or '🏳️'} {n}\n"
             txt += f"\n{style_div()}\n📝 /гражданство <название страны>"
             return send(peer_id, txt, kb_country())
 
@@ -1736,25 +1806,16 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not co:
             cur.execute("SELECT name,flag FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{cname}%",))
             co = cur.fetchone()
-        if not co:
-            return send(peer_id, f"❌ Страна «{cname}» не найдена. Список: /страна")
+        if not co: return send(peer_id, f"❌ Страна «{cname}» не найдена. Список: /страна")
         target_country, flag = co[0], co[1]
-
         old = ucountry(uid)
-        if old == target_country:
-            return send(peer_id, f"❌ Ты уже гражданин {flag} {target_country}")
-
-        if old:
-            cur.execute("DELETE FROM members WHERE user_id=?", (uid,))
+        if old == target_country: return send(peer_id, f"❌ Ты уже гражданин {flag} {target_country}")
+        if old: cur.execute("DELETE FROM members WHERE user_id=?", (uid,))
         cur.execute("UPDATE users SET country=? WHERE user_id=?", (target_country, uid))
         cur.execute("INSERT OR REPLACE INTO members(user_id,country,position) VALUES(?,?,?)",
-                    (uid, target_country, "Гражданин"))
-        conn.commit()
-
-        if old:
-            send(peer_id, f"✅ Гражданство изменено: {old} → {flag} {target_country}")
-        else:
-            send(peer_id, f"✅ Ты стал гражданином {flag} {target_country}!")
+                    (uid, target_country, "Гражданин")); conn.commit()
+        if old: send(peer_id, f"✅ Гражданство изменено: {old} → {flag} {target_country}")
+        else:   send(peer_id, f"✅ Ты стал гражданином {flag} {target_country}!")
         return
 
     if cmd in ("/страны","/страна"):
@@ -1773,8 +1834,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         pos = get_position(uid) or "—"; cn = ucountry(uid) or "—"
         co = get_country(cn) if cn != "—" else None; fl = co[1] if co else "—"
         send(peer_id, card("ПАСПОРТ", [
-            ("👤",name_of(uid)),("🆔",f"id{uid}"),
-            ("🌍",f"{fl} {cn}"),("💼",pos),
+            ("👤",name_of(uid)),("🆔",f"id{uid}"),("🌍",f"{fl} {cn}"),("💼",pos),
         ]), kb_country()); return
 
     if cmd == "/казна":
@@ -1782,8 +1842,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not c: return
         co = get_country(c); st = get_stock(c)
         send(peer_id, card(f"КАЗНА {c}", [
-            ("💰",f"{fmt(co[3])} 💵"),("🍞",f"{fmt(st[1])}"),("🔫",f"{fmt(st[2])}"),
-            ("🏙",f"{co[5]}"),
+            ("💰",f"{fmt(co[3])} 💵"),("🍞",f"{fmt(st[1])}"),("🔫",f"{fmt(st[2])}"),("🏙",f"{co[5]}"),
         ]), kb_country()); return
 
     if cmd == "/армия":
@@ -1854,9 +1913,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         txt = (f"{style_div()}\n     🔇 МУТ ВЫДАН\n{style_div()}\n\n"
                f"  ✅ Кому: {mention(t)}\n  ⏳ Срок: {time_left_fmt(m*60)} (до {dt})\n"
                f"  📝 Причина: {reason}\n  👮 Модератор: @id{uid} ({an})\n\n{style_div()}")
-        send(peer_id, txt)
-        send_uid(t, txt + "\n\n🚫 Писать запрещено")
-        return
+        send(peer_id, txt); send_uid(t, txt + "\n\n🚫 Писать запрещено"); return
 
     if cmd == "/unmute":
         if not is_admin(uid): return
@@ -1902,8 +1959,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for (cid,) in chats:
             try: vk.messages.removeChatUser(chat_id=cid, user_id=t); kicked += 1
             except: pass
-        if chat_id:
-            if kick_user(chat_id, t): kicked += 1
+        if chat_id and kick_user(chat_id, t): kicked += 1
         send(peer_id, f"🚫 GBAN {mention(t)}\n🏛 Из {kicked} чатов\n📝 {reason}")
         send_uid(t, f"🚫 Глобальный бан: {reason}"); return
 
@@ -1980,8 +2036,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t: return
         pw = gen_password(); set_password(t, pw)
-        send(peer_id, f"🔐 → {mention(t)}")
-        send_uid(t, f"🔐 `{pw}`"); return
+        send(peer_id, f"🔐 → {mention(t)}"); send_uid(t, f"🔐 `{pw}`"); return
 
     if cmd == "/staff":
         if not chat_id: return
@@ -2076,7 +2131,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: return
         upd_balance(t, -a); send(peer_id, f"✅ -{fmt(a)} 💵"); return
 
-    # ============ ТИТУЛЫ ============
     if cmd == "/мтитул":
         bonus, _ = get_title_bonus(uid)
         send(peer_id, card("МОЙ ТИТУЛ", [
@@ -2092,7 +2146,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("UPDATE users SET title=? WHERE user_id=?", (title, t)); conn.commit()
         send(peer_id, f"✅ {mention(t)}: {title}"); return
 
-    # ============ ПРОМО ============
     if cmd == "/promo":
         if len(args)<2: return
         code = args[1].upper()
@@ -2185,14 +2238,10 @@ def handle_chat_invite(peer_id, member_id):
 def main():
     global vk, longpoll
     log("⚔️ Бот запускается...")
-
-    # Защита: если longpoll не создан при импорте — создаём здесь
     if longpoll is None or vk is None:
         log("📡 Повторная инициализация VK в main()...")
         if not _init_vk():
-            log("❌ Не удалось инициализировать VK")
-            return
-
+            log("❌ Не удалось инициализировать VK"); return
     try:
         get_user(MAIN_OWNER)
         for ow in OWNERS:
@@ -2204,11 +2253,15 @@ def main():
         cur.execute("SELECT COUNT(*) FROM biz_types"); bc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM countries"); cc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM cities"); ctc = cur.fetchone()[0]
-        log(f"🏢 Бизнесов: {bc} | 🌍 Стран: {cc} | 🏙 Городов: {ctc}")
+        cur.execute("SELECT COUNT(*) FROM builds WHERE UPPER(type)='PIAR'"); pc = cur.fetchone()[0]
+        log(f"🏢 Бизнесов: {bc} | 🌍 Стран: {cc} | 🏙 Городов: {ctc} | 📢 PIAR-чатов: {pc}")
         log(f"🎨 Стиль: {style_name()}")
     except Exception as e: log(f"⚠️ {e}")
 
     log("🎧 Слушаю события...")
+    threading.Thread(target=pr_resend_worker, daemon=True).start()
+    log("🔁 Авто-пиар воркер запущен")
+
     while True:
         try:
             for event in longpoll.listen():
@@ -2238,8 +2291,7 @@ def main():
                 if not text: continue
                 try: handle_message(peer_id, uid, text, message_id, msg)
                 except Exception as e:
-                    log(f"❌ Handler: {e}")
-                    traceback.print_exc(file=sys.stdout)
+                    log(f"❌ Handler: {e}"); traceback.print_exc(file=sys.stdout)
         except Exception as e:
             log(f"❌ LongPoll: {type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stdout)
