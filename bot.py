@@ -9,11 +9,15 @@ def log(msg):
     print(msg, flush=True); sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
-TOKEN = os.getenv("VK_TOKEN")
+# ВАЖНО: токен лучше держать в env-переменной VK_TOKEN на Bothost.
+# FALLBACK_TOKEN — только для локального теста. Пустая строка = не используется.
+FALLBACK_TOKEN = ""
+
+TOKEN = os.getenv("VK_TOKEN") or FALLBACK_TOKEN
 GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
 MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
 if not TOKEN:
-    log("❌ Нет VK_TOKEN"); raise SystemExit(1)
+    log("❌ Нет VK_TOKEN (ни в env, ни в FALLBACK_TOKEN)"); raise SystemExit(1)
 
 _owners_env = os.getenv("VK_OWNERS", "")
 OWNERS = {MAIN_OWNER}
@@ -142,7 +146,6 @@ def init_db():
         reports INTEGER DEFAULT 0, offers INTEGER DEFAULT 0, tickets INTEGER DEFAULT 0)""")
     conn.commit()
 
-    # --- БАЗОВЫЕ РОЛИ ---
     base_roles = [
         ("Гл.Владелец",15,101,"👑"),("Владелец",14,100,"💎"),
         ("Зам. Владельца",14,99,"🎭"),("Генеральный Деректор",14,98,"🎭"),
@@ -170,7 +173,6 @@ def init_db():
                         (n, lvl, prio, emo, MAIN_OWNER, int(time.time())))
         except: pass
 
-    # --- 20 СТРАН ---
     countries_data = {
         "Россия": ("🇷🇺", ["Москва", "Санкт-Петербург", "Новосибирск"], "Москва"),
         "США": ("🇺🇸", ["Вашингтон", "Нью-Йорк", "Лос-Анджелес"], "Вашингтон"),
@@ -206,7 +208,6 @@ def init_db():
                             (ct, cn, 1, 10000, 5000, 1000, is_cap))
         except: pass
 
-    # --- ТИТУЛЫ ---
     default_titles = [
         ("🐉 Дракон","🐉",5),("🦅 Орёл","🦅",3),("🐺 Волк","🐺",3),("🦁 Лев","🦁",4),
         ("🐯 Тигр","🐯",4),("🦊 Лис","🦊",2),("🐻 Медведь","🐻",3),("⚡ Быстрый","⚡",2),
@@ -219,7 +220,6 @@ def init_db():
                         (n, e, lv, MAIN_OWNER, int(time.time())))
         except: pass
 
-    # --- РАБОТЫ ---
     jobs = [
         ("Курьер",5000,25,0),("Продавец",8000,25,50),("Охранник",10000,25,100),
         ("Инженер",15000,25,200),("Врач",20000,25,350),("Полицейский",22000,25,500),
@@ -235,7 +235,6 @@ def init_db():
                 cur.execute("INSERT INTO jobs(name,salary,exp,min_exp) VALUES(?,?,?,?)", (j,s,e,me))
         except: pass
 
-    # --- БИЗНЕСЫ ---
     biz = [
         ("Киоск",50000,2000),("Магазин",100000,5000),("Кафе",200000,10000),
         ("Ресторан",350000,18000),("Автомойка",500000,25000),("Отель",700000,35000),
@@ -257,7 +256,6 @@ def init_db():
         try: cur.execute("INSERT OR IGNORE INTO biz_types(name,price,income) VALUES(?,?,?)", (b,p,i))
         except: pass
 
-    # --- ТАРИФЫ ПИАРА ---
     try:
         cur.execute("DELETE FROM pr_tariffs WHERE name IN ('Малый','Средний','Большой','VIP')")
         conn.commit()
@@ -304,7 +302,405 @@ for t, c, d in [
     ("users","captures","INTEGER DEFAULT 0"),
 ]:
     _add_col(t, c, d)
-    # ============ ИГРЫ ============
+    # ============ СТИЛЬ ============
+def load_style():
+    global CURRENT_STYLE
+    cur.execute("SELECT value FROM bot_settings WHERE key='style'")
+    r = cur.fetchone()
+    if r and r[0] in STYLES: CURRENT_STYLE = r[0]
+    else: CURRENT_STYLE = "обычный"
+    log(f"🎨 Стиль: {STYLES[CURRENT_STYLE]['name']}")
+load_style()
+
+def set_style(name):
+    global CURRENT_STYLE
+    if name not in STYLES: return False
+    CURRENT_STYLE = name
+    cur.execute("INSERT OR REPLACE INTO bot_settings(key,value) VALUES(?,?)", ("style", name))
+    conn.commit(); return True
+
+def style_cfg(): return STYLES.get(CURRENT_STYLE, STYLES["обычный"])
+def style_div(): return style_cfg()["div"] * 16
+def style_emoji(): return style_cfg()["emoji"]
+def style_bonus(): return style_cfg()["bonus"]
+def style_name(): return style_cfg()["name"]
+
+# ============ ХЕЛПЕРЫ ЮЗЕРА ============
+def get_user(uid):
+    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,)); r = cur.fetchone()
+    if not r:
+        cur.execute("INSERT INTO users(user_id) VALUES(?)", (uid,)); conn.commit()
+        cur.execute("SELECT * FROM users WHERE user_id=?", (uid,)); r = cur.fetchone()
+    return r
+
+def ufield(uid, field, default=None):
+    get_user(uid)
+    try:
+        cur.execute(f"SELECT {field} FROM users WHERE user_id=?", (uid,))
+        r = cur.fetchone()
+        return r[0] if r and r[0] is not None else default
+    except: return default
+
+def ubal(uid): return ufield(uid, "balance", 0)
+def ubank(uid): return ufield(uid, "bank", 0)
+def uexp(uid): return ufield(uid, "exp", 0)
+def ulevel(uid): return ufield(uid, "level", 0)
+def ucountry(uid): return ufield(uid, "country", None)
+def uwork(uid): return ufield(uid, "work", None)
+def utitle(uid): return ufield(uid, "title", None)
+def urep(uid): return ufield(uid, "rep", 0)
+def udaily(uid): return ufield(uid, "daily", 0)
+def ulast_bonus(uid): return ufield(uid, "last_bonus", 0)
+def umute(uid): return ufield(uid, "mute_until", 0)
+def upassword(uid): return ufield(uid, "password", None)
+def upriority(uid): return ufield(uid, "priority", 0)
+def uexp_last(uid): return ufield(uid, "exp_last", 0)
+
+def get_password(uid): return upassword(uid)
+def set_password(uid, pw):
+    get_user(uid); cur.execute("UPDATE users SET password=? WHERE user_id=?", (pw, uid)); conn.commit()
+def upd_balance(uid, amount):
+    get_user(uid); cur.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, uid)); conn.commit()
+def upd_bank(uid, amount):
+    get_user(uid); cur.execute("UPDATE users SET bank=bank+? WHERE user_id=?", (amount, uid)); conn.commit()
+def get_balance(uid): return ubal(uid)
+def get_bank(uid): return ubank(uid)
+
+# ============ УРОВНИ ============
+LEVEL_TITLES = [
+    (0,"🌱 Новичок"),(10,"🪖 Рядовой"),(25,"🎯 Боец"),(50,"⚔️ Воин"),
+    (75,"🛡 Ветеран"),(100,"🏅 Сержант"),(150,"🎖️ Лейтенант"),(200,"👑 Капитан"),
+    (300,"⚜️ Майор"),(400,"💫 Полковник"),(500,"🔥 Генерал"),(650,"⭐ Маршал"),
+    (800,"🌟 Легенда"),(950,"👑 Император"),(999,"🏆 БОГ ВОЙНЫ")
+]
+def get_title(level):
+    t = LEVEL_TITLES[0][1]
+    for lv, name in LEVEL_TITLES:
+        if level >= lv: t = name
+    return t
+
+PRIORITY_PREFIX = [
+    (101,"👑"),(100,"💎"),(90,"💫"),(80,"⚡"),(70,"👑"),(60,"👑"),
+    (50,"⚔️"),(40,"⚔️"),(30,"🛡"),(20,"🔨"),(10,"🎯"),(4,"🌿"),(0,"🌱"),
+]
+def get_priority_emoji(priority):
+    for p, emo in PRIORITY_PREFIX:
+        if priority >= p: return emo
+    return "🌱"
+
+def get_priority(uid):
+    if uid in OWNERS: return 101
+    p = upriority(uid)
+    if p and p > 0: return p
+    cur.execute("SELECT r.priority FROM global_roles gr JOIN roles r ON r.name=gr.role WHERE gr.user_id=?", (uid,))
+    r2 = cur.fetchone()
+    if r2 and r2[0] is not None: return r2[0]
+    return 0
+
+def get_user_emoji(uid):
+    t = utitle(uid)
+    if t:
+        emoji = ""
+        for ch in t:
+            if ord(ch) > 0x2600: emoji += ch
+        if emoji: return emoji
+    return get_priority_emoji(get_priority(uid))
+
+def get_title_bonus(uid):
+    title = utitle(uid)
+    if not title: return 1.0, "—"
+    cur.execute("SELECT level FROM custom_titles WHERE name=?", (title,)); t = cur.fetchone()
+    if not t: return 1.5, title
+    lvl = t[0]
+    return round(1.0 + (lvl/5.0), 2), title
+
+def is_owner(uid):
+    if uid in OWNERS: return True
+    return get_priority(uid) >= 80
+def is_admin(uid): return get_priority(uid) >= 10
+def is_staff(uid): return get_priority(uid) >= 4
+
+def is_muted(uid):
+    m = umute(uid)
+    if m and m > int(time.time()): return m - int(time.time())
+    return 0
+
+def is_banned(uid):
+    cur.execute("SELECT reason FROM bans WHERE user_id=?", (uid,)); r = cur.fetchone()
+    return r[0] if r else None
+
+def peer_to_chat(p): return p - 2000000000 if p >= 2000000000 else None
+def fmt(n): return f"{n:,}".replace(",", " ")
+
+def time_left_fmt(seconds):
+    seconds = int(seconds)
+    if seconds <= 0: return "0 сек"
+    d = seconds // 86400; h = (seconds % 86400) // 3600
+    m = (seconds % 3600) // 60; s = seconds % 60
+    parts = []
+    if d: parts.append(f"{d} дн")
+    if h: parts.append(f"{h} ч")
+    if m and not d: parts.append(f"{m} мин")
+    if s and not d and not h: parts.append(f"{s} сек")
+    return " ".join(parts) if parts else "0 сек"
+
+def is_bot_disabled(peer_id):
+    cur.execute("SELECT peer_id FROM bot_disabled WHERE peer_id=?", (peer_id,))
+    return bool(cur.fetchone())
+
+def name_of(uid):
+    emoji = get_user_emoji(uid)
+    cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); r = cur.fetchone()
+    nick = r[0] if r and r[0] else None
+    if not nick:
+        try:
+            u = vk.users.get(user_ids=uid)[0]
+            nick = f"{u['first_name']} {u['last_name']}"
+        except: nick = f"id{uid}"
+    custom = utitle(uid)
+    if custom: return f"{emoji} {custom} {nick}"
+    return f"{emoji} {nick}"
+
+def mention(uid): return f"@id{uid} ({name_of(uid)})"
+
+def extract_uid(arg, msg=None):
+    if msg and msg.get('reply_message'): return msg['reply_message']['from_id']
+    if not arg: return None
+    if arg.startswith('[id') and '|' in arg:
+        try: return int(arg[3:].split('|')[0])
+        except: pass
+    if arg.startswith('@'):
+        try:
+            r = vk.utils.resolveScreenName(screen_name=arg[1:])
+            if r and r.get('type') == 'user': return r['object_id']
+        except: pass
+    try: return int(arg)
+    except: return None
+
+# ============ СТРАНЫ / ГОРОДА ============
+def get_country(n):
+    cur.execute("SELECT * FROM countries WHERE name=?", (n,)); return cur.fetchone()
+def get_country_of(uid): return ucountry(uid)
+def get_stock(c):
+    cur.execute("SELECT * FROM stockpile WHERE country=?", (c,)); r = cur.fetchone()
+    if not r:
+        cur.execute("INSERT INTO stockpile(country) VALUES(?)", (c,)); conn.commit()
+        cur.execute("SELECT * FROM stockpile WHERE country=?", (c,)); r = cur.fetchone()
+    return r
+def upd_stock(c, f, a):
+    get_stock(c); cur.execute(f"UPDATE stockpile SET {f}={f}+? WHERE country=?", (a, c)); conn.commit()
+def get_carmy(c):
+    cur.execute("SELECT * FROM country_army WHERE country=?", (c,)); r = cur.fetchone()
+    if not r:
+        cur.execute("INSERT INTO country_army(country) VALUES(?)", (c,)); conn.commit()
+        cur.execute("SELECT * FROM country_army WHERE country=?", (c,)); r = cur.fetchone()
+    return r
+def upd_carmy(c, f, a):
+    get_carmy(c); cur.execute(f"UPDATE country_army SET {f}={f}+? WHERE country=?", (a, c)); conn.commit()
+def get_position(uid):
+    cur.execute("SELECT position FROM members WHERE user_id=?", (uid,)); r = cur.fetchone()
+    return r[0] if r else None
+
+def is_president(uid):
+    c = get_country_of(uid)
+    if not c: return False
+    co = get_country(c); return co and co[2] == uid
+def is_government(uid): return get_position(uid) in ('Президент','Министр','Генерал','Губернатор')
+
+# ============ ИГРОВОЕ СОСТОЯНИЕ / EXP ============
+def set_game_state(uid, game):
+    cur.execute("INSERT OR REPLACE INTO game_state(user_id,game,ts) VALUES(?,?,?)", (uid, game, int(time.time()))); conn.commit()
+def get_game_state(uid):
+    cur.execute("SELECT game,ts FROM game_state WHERE user_id=?", (uid,)); r = cur.fetchone()
+    if r and int(time.time()) - r[1] < 300: return r[0]
+    return None
+def clear_game_state(uid):
+    cur.execute("DELETE FROM game_state WHERE user_id=?", (uid,)); conn.commit()
+
+def add_exp(uid, amount):
+    get_user(uid)
+    cur.execute("UPDATE users SET exp = exp + ? WHERE user_id=?", (amount, uid))
+    e = uexp(uid); lv = ulevel(uid)
+    new_lv = min((e or 0) // 100, 999)
+    if new_lv > (lv or 0):
+        cur.execute("UPDATE users SET level=? WHERE user_id=?", (new_lv, uid)); conn.commit()
+        return new_lv
+    conn.commit(); return None
+
+def gen_password():
+    return ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=8))
+
+# ============ СТАТИСТИКА АДМИНОВ ============
+def inc_admin_stat(uid, field):
+    if field not in ("bans","mutes","warns","reports","offers","tickets"): return
+    cur.execute("SELECT user_id FROM admin_stats WHERE user_id=?", (uid,))
+    if not cur.fetchone():
+        cur.execute("INSERT INTO admin_stats(user_id) VALUES(?)", (uid,))
+    cur.execute(f"UPDATE admin_stats SET {field}={field}+1 WHERE user_id=?", (uid,))
+    conn.commit()
+
+def get_admin_stats(uid):
+    cur.execute("SELECT bans,mutes,warns,reports,offers,tickets FROM admin_stats WHERE user_id=?", (uid,))
+    r = cur.fetchone()
+    if not r: return (0,0,0,0,0,0)
+    return r
+
+# ============ МАТ-ФИЛЬТР ============
+def has_mat(text):
+    low = text.lower()
+    return any(root in low for root in MAT_ROOTS)
+
+# ============ VK ИНИЦИАЛИЗАЦИЯ ============
+vk = None
+longpoll = None
+
+def _init_vk():
+    global vk, longpoll
+    try:
+        log("📡 VK сессия...")
+        _sess = vk_api.VkApi(token=TOKEN)
+        vk = _sess.get_api()
+        try:
+            info = vk.groups.getById(group_id=GROUP_ID)
+            log(f"✅ Группа: {info[0]['name']}")
+        except Exception as e:
+            log(f"❌ {type(e).__name__}: {e}"); return False
+        longpoll = VkBotLongPoll(_sess, GROUP_ID)
+        log("✅ Long Poll готов")
+        return True
+    except Exception as e:
+        log(f"❌ VK: {e}"); traceback.print_exc(file=sys.stdout)
+        return False
+
+if not _init_vk():
+    log("⚠️ VK не инициализирован на старте — попробуем в main()")
+
+def send(peer_id, text, keyboard=None, attachment=None):
+    if peer_id >= 2000000000: keyboard = None
+    try:
+        kw = {"peer_id": peer_id, "message": text, "random_id": get_random_id(), "keyboard": keyboard}
+        if attachment: kw["attachment"] = attachment
+        vk.messages.send(**kw)
+    except Exception as e: log(f"❌ Send: {e}")
+
+def send_uid(user_id, text, keyboard=None):
+    try: vk.messages.send(user_id=user_id, message=text, random_id=get_random_id(), keyboard=keyboard)
+    except Exception as e: log(f"❌ SendUID: {e}")
+
+def delete_message(peer_id, mid):
+    try: vk.messages.delete(message_ids=mid, delete_for_all=1); return True
+    except: return False
+
+def kick_user(chat_id, user_id):
+    try: vk.messages.removeChatUser(chat_id=chat_id, user_id=user_id); return True
+    except Exception as e: log(f"❌ Kick: {e}"); return False
+
+def get_chat_members(chat_id):
+    try:
+        r = vk.messages.getConversationMembers(peer_id=2000000000+chat_id)
+        return [m['member_id'] for m in r.get('items', []) if m.get('member_id', 0) > 0]
+    except: return []
+
+def get_report_chat():
+    cur.execute("SELECT peer_id FROM report_chats ORDER BY linked_at DESC LIMIT 1")
+    r = cur.fetchone()
+    return r[0] if r else None
+
+# ============ КЛАВИАТУРЫ ============
+def header(t):
+    cfg = style_cfg(); div = cfg["div"] * 16
+    return f"{div}\n     {cfg['emoji']} {t} {cfg['emoji']}\n{div}"
+
+def card(title, rows, footer=None):
+    txt = header(title) + "\n"
+    for k, v in rows: txt += f"  {k} ➜ {v}\n"
+    txt += style_div()
+    if footer: txt += f"\n{footer}"
+    return txt
+
+def kb(btns): return json.dumps({"one_time": False, "buttons": btns}, ensure_ascii=False)
+def kbc(label, cmd, color="primary"):
+    return {"action":{"type":"callback","label":label,"payload":json.dumps({"cmd":cmd})},"color":color}
+def kbt(label, cmd, color="primary"):
+    return {"action":{"type":"text","label":label,"payload":json.dumps({"cmd":cmd})},"color":color}
+
+def kb_main():
+    return kb([
+        [kbt("💰 Баланс","/баланс","positive"), kbt("🏦 Банк","/банк","positive")],
+        [kbt("🎰 Клуб","/клуб"), kbt("🎲 Казино","/казино")],
+        [kbt("🌍 Страна","/страна","secondary"), kbt("🎫 Гражданство","/гражданство","positive")],
+        [kbt("🏙 Города","/моигорода","secondary"), kbt("🏴 Налёт","/налёт","negative")],
+        [kbt("💼 Работы","/работы"), kbt("🏢 Бизнесы","/списокбиз")],
+        [kbt("🏆 Уровень","/уровень","positive"), kbt("🎖️ Титул","/мтитул","primary")],
+        [kbt("📢 Пиар","/пиар","positive"), kbt("🆘 Помощь","/help","secondary")],
+        [kbt("📊 Моя стата","/мойстат","secondary")],
+    ])
+
+def kb_games():
+    return kb([
+        [kbc("🎰 Казино","/казино"), kbc("🪙 Монетка","/монетка")],
+        [kbc("🎲 Кубик","/кубик"), kbc("🍒 Слоты","/слоты")],
+        [kbc("🎡 Рулетка","/рулетка"), kbc("🎯 Дартс","/дартс")],
+        [kbc("🚀 Краш","/краш"), kbc("🃏 Блэкджек","/блэкджек")],
+        [kbc("💣 Мины","/мины"), kbc("🎁 Кейс","/кейс")],
+        [kbc("🏗 Башня","/башня"), kbc("🏎 Гонка","/гонка")],
+        [kbc("🎣 Рыбалка","/рыбалка"), kbc("◀️ Меню","/меню","secondary")],
+    ])
+
+def kb_country():
+    return kb([
+        [kbt("🌍 Страны","/страны","primary"), kbt("🎫 Гражданство","/гражданство","positive")],
+        [kbt("🏙 Мои города","/моигорода","primary"), kbt("🏴 Налёт","/налёт","negative")],
+        [kbt("🛒 Купить город","/купитьгород","secondary"), kbt("🏛 Казна","/казна","secondary")],
+        [kbt("🎖️ Армия","/армия","secondary"), kbt("👥 Граждане","/граждане","secondary")],
+        [kbt("🗺 Гос.команды","/госскоманды"), kbt("◀️ Меню","/меню","secondary")],
+    ])
+
+def kb_back(): return kb([[kbt("◀️ Меню","/меню","secondary")]])
+def kb_bank():
+    return kb([
+        [kbc("💵 Положить 1000","/положить 1000","positive"), kbc("💸 Снять 1000","/снять 1000","negative")],
+        [kbc("💰 Баланс","/баланс"), kbc("◀️ Меню","/меню","secondary")],
+    ])
+def kb_ticket(tid):
+    return kb([
+        [kbc("💬 Chat", f"/tk chat {tid}")],
+        [kbc("📨 Передать обращение", f"/tk forward {tid}")],
+        [kbc("📢 Позвать Директора", f"/tk director {tid}", "negative")],
+        [kbc("🔒 Закрыть тикет", f"/tk close {tid}", "negative")],
+        [kbc("🚫 Флуд", f"/tk flud {tid}", "negative")],
+    ])
+
+TRANSPORT_PRICE = {"грузовик":50000,"поезд":250000,"корабль":500000,"самолет":1000000}
+PRODUCTS = ("еда","оружие","ресурсы","топливо","деньги")
+BUILDINGS = {"ферма":100000,"завод":250000,"нефтевышка":300000,"казарма":200000,"радар":150000,"госпиталь":180000}
+
+GAMES_INFO = {
+    "/казино":("🎰","КАЗИНО","Испытай удачу!"),
+    "/монетка":("🪙","МОНЕТКА","Орёл или решка?"),
+    "/кубик":("🎲","КУБИК","Бросай кубик!"),
+    "/слоты":("🍒","СЛОТЫ","Собери 3 в ряд!"),
+    "/рулетка":("🎡","РУЛЕТКА","Крути колесо!"),
+    "/дартс":("🎯","ДАРТС","Попади в яблочко!"),
+    "/краш":("🚀","КРАШ","Успей забрать!"),
+    "/блэкджек":("🃏","БЛЭКДЖЕК","Набери 21!"),
+    "/мины":("💣","МИНЫ","Не подорвись!"),
+    "/кейс":("🎁","КЕЙС","Открой кейс!"),
+    "/колесо":("🎡","КОЛЕСО","Крути!"),
+    "/башня":("🏗","БАШНЯ","Строй выше!"),
+    "/гонка":("🏎","ГОНКА","Кто быстрее?"),
+    "/рыбалка":("🎣","РЫБАЛКА","Поймай рыбку!"),
+}
+
+TEXT_ALIASES = {
+    "💰 баланс":"/баланс","🏦 банк":"/банк","🏆 топ":"/топ","🎰 клуб":"/клуб","🎲 казино":"/казино",
+    "🌍 страна":"/страна","📘 паспорт":"/паспорт","🎁 приз":"/приз","📋 задания":"/задания",
+    "⚔️ войны":"/войны","◀️ меню":"/меню","🎖️ титул":"/мтитул","📢 пиар":"/пиар",
+    "🎰 казино":"/казино","🪙 монетка":"/монетка","🎲 кубик":"/кубик","🍒 слоты":"/слоты",
+    "💼 работы":"/работы","🏢 бизнесы":"/списокбиз","🏆 уровень":"/уровень",
+    "📊 стата":"/стата","🆘 помощь":"/help","🏙 города":"/моигорода",
+    }
+# ============ ИГРЫ ============
 def play_game(peer_id, uid, game, bet):
     if bet <= 0: return send(peer_id, "❌ Ставка > 0")
     if get_balance(uid) < bet: return send(peer_id, f"❌ Мало!\n💳 {fmt(get_balance(uid))} 💵")
@@ -433,7 +829,9 @@ def build_help_user():
   /налёт <город> — грабёж чужого города (50 000 💵, 40%)
 
 🌍 СТРАНА
-  /страны /паспорт /казна /граждане /армия /города
+  /страны /страна
+  /гражданство [название] — вступить в страну
+  /паспорт /казна /граждане /армия /города
 
 📢 СОЦИАЛЬНОЕ
   /пиар /pr_my /promo /подписка /донат
@@ -821,7 +1219,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         r = cur.fetchone()
         send(peer_id, card("📊 ПИАР", [("📢",str(r[0] or 0)),("💰",f"{fmt(r[1] or 0)} ₽")])); return
 
-    # ============ ПАРОЛЬ ============
+    # ============ ПАРОЛЬ / АДМИНПАНЕЛЬ ============
     if cmd in ("/pass","/пароль"):
         pw = get_password(uid)
         return send(peer_id, f"🔑 `{pw}`\n/adminpanel {pw}" if pw else "❌ Нет пароля")
@@ -1310,7 +1708,55 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for n,i in rows: txt += f"  • {n} — {fmt(i)} 💵\n"; t += i
         send(peer_id, txt + f"\n  🏦 {fmt(t)} 💵\n{style_div()}"); return
 
-    # ============ СТРАНЫ ============
+    # ============ СТРАНЫ / ГРАЖДАНСТВО ============
+    if cmd == "/гражданство":
+        if len(args) < 2:
+            c = ucountry(uid)
+            if c:
+                co = get_country(c)
+                fl = co[1] if co else "🏳️"
+                return send(peer_id,
+                    card("🌍 ВАШЕ ГРАЖДАНСТВО", [
+                        ("👤", name_of(uid)),
+                        ("🌍", f"{fl} {c}"),
+                        ("💼", get_position(uid) or "Гражданин"),
+                    ], f"📝 Сменить: /гражданство <страна>"),
+                    kb_country())
+            cur.execute("SELECT name,flag FROM countries WHERE alive=1 ORDER BY name")
+            rows = cur.fetchall()
+            txt = f"{header('🌍 ВЫБОР ГРАЖДАНСТВА')}\n\n  У тебя пока нет гражданства.\n\n"
+            for n,f in rows:
+                txt += f"  {f or '🏳️'} {n}\n"
+            txt += f"\n{style_div()}\n📝 /гражданство <название страны>"
+            return send(peer_id, txt, kb_country())
+
+        cname = " ".join(args[1:]).strip()
+        cur.execute("SELECT name,flag FROM countries WHERE LOWER(name)=LOWER(?) AND alive=1", (cname,))
+        co = cur.fetchone()
+        if not co:
+            cur.execute("SELECT name,flag FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{cname}%",))
+            co = cur.fetchone()
+        if not co:
+            return send(peer_id, f"❌ Страна «{cname}» не найдена. Список: /страна")
+        target_country, flag = co[0], co[1]
+
+        old = ucountry(uid)
+        if old == target_country:
+            return send(peer_id, f"❌ Ты уже гражданин {flag} {target_country}")
+
+        if old:
+            cur.execute("DELETE FROM members WHERE user_id=?", (uid,))
+        cur.execute("UPDATE users SET country=? WHERE user_id=?", (target_country, uid))
+        cur.execute("INSERT OR REPLACE INTO members(user_id,country,position) VALUES(?,?,?)",
+                    (uid, target_country, "Гражданин"))
+        conn.commit()
+
+        if old:
+            send(peer_id, f"✅ Гражданство изменено: {old} → {flag} {target_country}")
+        else:
+            send(peer_id, f"✅ Ты стал гражданином {flag} {target_country}!")
+        return
+
     if cmd in ("/страны","/страна"):
         cur.execute("SELECT name,flag,treasury,army,cities,president FROM countries WHERE alive=1 ORDER BY cities DESC")
         rows = cur.fetchall()
@@ -1318,8 +1764,10 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         txt = header("СТРАНЫ МИРА")+"\n\n"
         for n,f,t,a,c,pr in rows[:25]:
             pn = name_of(pr) if pr else "❌"
-            txt += f"  {f or '🏳️'} {n} | 👑 {pn} | ⚔️ {fmt(a)} | 🏙 {c}/40\n"
-        send(peer_id, txt + f"\n{style_div()}", kb_country()); return
+            marker = " ⬅️" if ucountry(uid) == n else ""
+            txt += f"  {f or '🏳️'} {n} | 👑 {pn} | ⚔️ {fmt(a)} | 🏙 {c}/40{marker}\n"
+        txt += f"\n{style_div()}\n📝 Вступить: /гражданство <страна>"
+        send(peer_id, txt, kb_country()); return
 
     if cmd in ("/паспорт","📘 паспорт"):
         pos = get_position(uid) or "—"; cn = ucountry(uid) or "—"
@@ -1348,7 +1796,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd in ("/граждане","/города","/правительство","/должности","/очки"):
         c = ucountry(uid)
         if not c: return
-        co = get_country(c)
         if cmd == "/граждане":
             cur.execute("SELECT user_id,position FROM members WHERE country=?", (c,)); rows = cur.fetchall()
             txt = header(f"ГРАЖДАНЕ {c}")+f"\n\n"
@@ -1736,7 +2183,16 @@ def handle_chat_invite(peer_id, member_id):
 
 # ============ ЗАПУСК ============
 def main():
+    global vk, longpoll
     log("⚔️ Бот запускается...")
+
+    # Защита: если longpoll не создан при импорте — создаём здесь
+    if longpoll is None or vk is None:
+        log("📡 Повторная инициализация VK в main()...")
+        if not _init_vk():
+            log("❌ Не удалось инициализировать VK")
+            return
+
     try:
         get_user(MAIN_OWNER)
         for ow in OWNERS:
