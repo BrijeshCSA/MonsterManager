@@ -506,7 +506,10 @@ def get_position(uid):
 def is_president(uid):
     c = get_country_of(uid)
     if not c: return False
-    co = get_country(c); return co and co[2] == uid
+    co = get_country(c)
+    if not co: return False
+    # co[2] = owner, co[3] = president
+    return co[3] == uid or co[2] == uid
 def is_government(uid): return get_position(uid) in ('Президент','Министр','Генерал','Губернатор')
 
 # ============ ИГРОВОЕ СОСТОЯНИЕ / EXP ============
@@ -654,6 +657,7 @@ def kb_country():
     return kb([
         [kbt("🌍 Страны","/страны","primary"), kbt("🎫 Гражданство","/гражданство","positive")],
         [kbt("🏙 Мои города","/моигорода","primary"), kbt("🏴 Налёт","/налёт","negative")],
+        [kbt("👑 Президент","/президент","positive")],
         [kbt("🛒 Купить город","/купитьгород","secondary"), kbt("🏛 Казна","/казна","secondary")],
         [kbt("🎖️ Армия","/армия","secondary"), kbt("👥 Граждане","/граждане","secondary")],
         [kbt("🗺 Гос.команды","/госскоманды"), kbt("◀️ Меню","/меню","secondary")],
@@ -702,8 +706,24 @@ TEXT_ALIASES = {
     "🎰 казино":"/казино","🪙 монетка":"/монетка","🎲 кубик":"/кубик","🍒 слоты":"/слоты",
     "💼 работы":"/работы","🏢 бизнесы":"/списокбиз","🏆 уровень":"/уровень",
     "📊 стата":"/стата","🆘 помощь":"/help","🏙 города":"/моигорода",
-             }
-# ============ ИГРЫ ============
+}
+
+# ============ ПРОМОКОД-КАРТОЧКА ============
+def promo_card(code, amount, uses, max_uses):
+    left = max_uses - uses
+    status = "🟢 Активен" if left > 0 else "🔴 Исчерпан"
+    return (
+        f"{style_div()}\n"
+        f"     {style_emoji()} 🎟️ ПРОМОКОД {style_emoji()}\n"
+        f"{style_div()}\n\n"
+        f"  🔑 ➜ `{code}`\n"
+        f"  💰 ➜ {fmt(amount)} 💵\n"
+        f"  👥 ➜ {uses} / {max_uses} активаций\n"
+        f"  📊 ➜ Осталось: {left}\n"
+        f"  {status}\n\n"
+        f"{style_div()}"
+         )
+    # ============ ИГРЫ ============
 def play_game(peer_id, uid, game, bet):
     if bet <= 0: return send(peer_id, "❌ Ставка > 0")
     if get_balance(uid) < bet: return send(peer_id, f"❌ Мало!\n💳 {fmt(get_balance(uid))} 💵")
@@ -840,6 +860,10 @@ def build_help_user():
   /пиар /пиар_авто /pr_my /promo /подписка /донат
   /report /offer /ивент /мафия /ежедневно
 
+🎟️ /promo <код> — активировать промокод
+
+⚔️ /война <страна> — только для генералов
+
 🏆 ТОПЫ
   /топ баланс | /топ сообщения | /топ маты
   /топ захваты | /топ уровень
@@ -884,10 +908,19 @@ def build_help_owner():
   /выдать /вернуть /обнулить /вайп
   /removestaff /setpass
 
-📢 ПИАР
-  /pr_orders /pr_stats /pr_ok <id> /pr_no <id>
+👑 ПРЕЗИДЕНТ И ДОЛЖНОСТИ
+  /президент <юзер> <страна>
+  /снятьпрезидента <страна>
+  /должность <юзер> <страна> <позиция>
 
-🎟️ /createpromo
+🎟️ ПРОМОКОДЫ
+  /createpromo <код> <сумма> <макс>
+  /promo_info <код>
+  /promo_list
+
+📢 ПИАР
+  /pr_orders /pr_stats /pr_ok <id> /pr_no <id> /pr_stop <id>
+
 🌍 /удалитьстрану /улучшить_страну
 ⚔️ /война /захват /мир /запуск /дрон
 
@@ -1484,6 +1517,118 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if len(args) < 2:
             return send(peer_id, f"📝 /налёт <название города>\n\n  💰 Стоимость: {fmt(RAID_COST)} 💵\n  🎯 Шанс успеха: 40%\n  🏆 Добыча: 20% от дохода города\n  ⏳ Кулдаун: 1 час", kb_country())
         return do_raid(peer_id, uid, " ".join(args[1:]))
+
+    # ============ ВОЙНА ============
+    if cmd == "/война":
+        c = ucountry(uid)
+        if not c:
+            return send(peer_id, "❌ Ты не гражданин страны")
+        position = get_position(uid)
+        if position != "Генерал" and not is_owner(uid):
+            return send(peer_id,
+                f"❌ /война доступна только генералам страны\n\n"
+                f"  🌍 Твоя страна: {c}\n"
+                f"  💼 Твоя должность: {position or 'Гражданин'}")
+        if len(args) < 2:
+            return send(peer_id, "📝 /война <страна>\n\n  ⚔️ Объявить войну другой стране")
+        target_name = " ".join(args[1:]).strip()
+        cur.execute("SELECT name,flag FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{target_name}%",))
+        co = cur.fetchone()
+        if not co:
+            return send(peer_id, f"❌ Страна «{target_name}» не найдена")
+        target_country, target_flag = co
+        if target_country == c:
+            return send(peer_id, "❌ Нельзя объявить войну своей стране")
+        cur.execute("SELECT id FROM wars WHERE attacker=? AND defender=? AND active=1", (c, target_country))
+        if cur.fetchone():
+            return send(peer_id, f"❌ Война с {target_flag} {target_country} уже идёт")
+        cur.execute("INSERT INTO wars(attacker,defender,started,active) VALUES(?,?,?,1)",
+                    (c, target_country, int(time.time())))
+        conn.commit()
+        cur.execute("SELECT flag FROM countries WHERE name=?", (c,)); cf = cur.fetchone()
+        my_flag = cf[0] if cf else "🏳️"
+        txt = (f"{style_div()}\n     ⚔️ ВОЙНА ОБЪЯВЛЕНА\n{style_div()}\n\n"
+               f"  {my_flag} {c}\n     ⚔️ ⚔️ ⚔️\n  {target_flag} {target_country}\n\n"
+               f"  👮 Генерал: {mention(uid)}\n"
+               f"  📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n{style_div()}")
+        send(peer_id, txt)
+        cur.execute("SELECT president, owner FROM countries WHERE name=?", (target_country,))
+        pres = cur.fetchone()
+        if pres:
+            for pid in [pres[0], pres[1]]:
+                if pid:
+                    try: send_uid(pid, txt)
+                    except: pass
+        return
+
+    # ============ ПРЕЗИДЕНТ И ДОЛЖНОСТИ ============
+    if cmd in ("/президент","/презик"):
+        if not is_owner(uid): return
+        if len(args) < 3:
+            return send(peer_id, "📝 /президент <юзер> <страна>\n\n  ⚠️ Только владелец (80+)")
+        t = extract_uid(args[1], event_msg)
+        if not t: return send(peer_id, "❌ Не понял кого")
+        cname = " ".join(args[2:]).strip()
+        cur.execute("SELECT name,flag,president FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{cname}%",))
+        co = cur.fetchone()
+        if not co: return send(peer_id, f"❌ Страна «{cname}» не найдена")
+        country_name, flag, old_pres = co
+        old_country = ucountry(t)
+        if old_country != country_name:
+            if old_country: cur.execute("DELETE FROM members WHERE user_id=?", (t,))
+            cur.execute("UPDATE users SET country=? WHERE user_id=?", (country_name, t))
+        cur.execute("UPDATE countries SET president=? WHERE name=?", (t, country_name))
+        cur.execute("INSERT OR REPLACE INTO members(user_id,country,position) VALUES(?,?,?)",
+                    (t, country_name, "Президент"))
+        conn.commit()
+        txt = (f"{style_div()}\n     👑 ПРЕЗИДЕНТ НАЗНАЧЕН\n{style_div()}\n\n"
+               f"  👤 {mention(t)}\n  🌍 {flag} {country_name}\n"
+               f"  👮 Назначил: {mention(uid)}\n\n{style_div()}")
+        send(peer_id, txt)
+        try: send_uid(t, txt + f"\n\n👑 Ты — президент {flag} {country_name}!")
+        except: pass
+        if old_pres and old_pres != t:
+            try: send_uid(old_pres, f"⚠️ Ты больше не президент {flag} {country_name}\n👤 Новый: {mention(t)}")
+            except: pass
+        return
+
+    if cmd in ("/снятьпрезидента","/unpres"):
+        if not is_owner(uid): return
+        if len(args) < 2: return send(peer_id, "📝 /снятьпрезидента <страна>")
+        cname = " ".join(args[1:]).strip()
+        cur.execute("SELECT name,flag,president FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{cname}%",))
+        co = cur.fetchone()
+        if not co: return send(peer_id, f"❌ Страна «{cname}» не найдена")
+        country_name, flag, old_pres = co
+        if not old_pres: return send(peer_id, f"❌ У {flag} {country_name} нет президента")
+        cur.execute("UPDATE countries SET president=NULL WHERE name=?", (country_name,))
+        cur.execute("UPDATE members SET position='Гражданин' WHERE user_id=? AND country=?", (old_pres, country_name))
+        conn.commit()
+        send(peer_id, f"👑 {mention(old_pres)} снят с поста президента {flag} {country_name}")
+        try: send_uid(old_pres, f"⚠️ Ты снят с поста президента {flag} {country_name}")
+        except: pass
+        return
+
+    if cmd in ("/должность","/назначить"):
+        if not is_owner(uid): return
+        if len(args) < 4:
+            return send(peer_id, "📝 /должность <юзер> <страна> <позиция>\n\n  Пример: /должность @ivan Россия Генерал")
+        t = extract_uid(args[1], event_msg)
+        if not t: return send(peer_id, "❌ Не понял кого")
+        cname = args[2]
+        position = " ".join(args[3:])
+        cur.execute("SELECT name,flag FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{cname}%",))
+        co = cur.fetchone()
+        if not co: return send(peer_id, f"❌ Страна «{cname}» не найдена")
+        country_name, flag = co
+        cur.execute("INSERT OR REPLACE INTO members(user_id,country,position) VALUES(?,?,?)",
+                    (t, country_name, position))
+        cur.execute("UPDATE users SET country=? WHERE user_id=?", (country_name, t))
+        conn.commit()
+        send(peer_id, f"✅ {mention(t)} — {position} в {flag} {country_name}")
+        try: send_uid(t, f"🎖️ Ты назначен: {position}\n🌍 {flag} {country_name}")
+        except: pass
+        return
 
     # ============ REPORT/OFFER ============
     if cmd == "/report":
@@ -2131,6 +2276,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: return
         upd_balance(t, -a); send(peer_id, f"✅ -{fmt(a)} 💵"); return
 
+    # ============ ТИТУЛЫ ============
     if cmd == "/мтитул":
         bonus, _ = get_title_bonus(uid)
         send(peer_id, card("МОЙ ТИТУЛ", [
@@ -2146,22 +2292,68 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("UPDATE users SET title=? WHERE user_id=?", (title, t)); conn.commit()
         send(peer_id, f"✅ {mention(t)}: {title}"); return
 
+    # ============ ПРОМОКОДЫ ============
     if cmd == "/promo":
-        if len(args)<2: return
+        if len(args)<2: return send(peer_id, "📝 /promo <код>")
         code = args[1].upper()
-        cur.execute("SELECT amount,uses,max_uses FROM promos WHERE code=?", (code,)); p = cur.fetchone()
-        if not p or p[1]>=p[2]: return send(peer_id, "❌")
+        cur.execute("SELECT amount,uses,max_uses FROM promos WHERE code=?", (code,))
+        p = cur.fetchone()
+        if not p:
+            return send(peer_id, f"❌ Промокод `{code}` не найден")
+        amount, uses, max_uses = p
+        if uses >= max_uses:
+            return send(peer_id, f"❌ Промокод `{code}` исчерпан\n👥 {uses}/{max_uses} активаций")
         cur.execute("UPDATE promos SET uses=uses+1 WHERE code=?", (code,)); conn.commit()
-        upd_balance(uid,p[0]); send(peer_id, f"🎟️ +{fmt(p[0])} 💵"); return
+        upd_balance(uid, amount)
+        send(peer_id,
+            f"✅ Промокод `{code}` активирован!\n\n"
+            f"  💰 +{fmt(amount)} 💵\n"
+            f"  👥 Активаций: {uses+1}/{max_uses}\n\n"
+            f"  💳 Баланс: {fmt(get_balance(uid))} 💵")
+        return
+
+    if cmd == "/promo_info":
+        if len(args) < 2: return send(peer_id, "📝 /promo_info <код>")
+        code = args[1].upper()
+        cur.execute("SELECT code,amount,uses,max_uses FROM promos WHERE code=?", (code,))
+        p = cur.fetchone()
+        if not p: return send(peer_id, f"❌ Промокод `{code}` не найден")
+        send(peer_id, promo_card(p[0], p[1], p[2], p[3]))
+        return
+
+    if cmd == "/promo_list":
+        if not is_owner(uid): return
+        cur.execute("SELECT code,amount,uses,max_uses FROM promos ORDER BY code")
+        rows = cur.fetchall()
+        if not rows:
+            return send(peer_id, "📋 Нет промокодов")
+        txt = f"{header('🎟️ ВСЕ ПРОМОКОДЫ')}\n\n  Всего: {len(rows)}\n\n"
+        for c, a, u, m in rows:
+            status = "🟢" if u < m else "🔴"
+            txt += f"  {status} `{c}` — {fmt(a)} 💵 — {u}/{m}\n"
+        send(peer_id, txt + f"\n{style_div()}\n📝 /promo_info <код>")
+        return
 
     if cmd == "/createpromo":
-        if not is_owner(uid): return
-        if len(args)<4: return
+        if not is_owner(uid):
+            return send(peer_id, "❌ Только владелец")
+        if len(args) < 4:
+            return send(peer_id, "📝 /createpromo <код> <сумма> <макс.активаций>\n\n  Пример: /createpromo PROMO100 10000 50")
         code = args[1].upper()
-        try: a = int(args[2]); u = int(args[3])
-        except: return
-        cur.execute("INSERT OR REPLACE INTO promos(code,amount,uses,max_uses) VALUES(?,?,0,?)", (code,a,u)); conn.commit()
-        send(peer_id, f"🎟️ {code} создан"); return
+        try:
+            a = int(args[2]); u = int(args[3])
+        except:
+            return send(peer_id, "❌ Сумма и кол-во — числа")
+        if a <= 0 or u <= 0:
+            return send(peer_id, "❌ Сумма и кол-во > 0")
+        cur.execute("SELECT code FROM promos WHERE code=?", (code,))
+        if cur.fetchone():
+            return send(peer_id, f"❌ Промокод `{code}` уже существует")
+        cur.execute("INSERT OR REPLACE INTO promos(code,amount,uses,max_uses) VALUES(?,?,0,?)",
+                    (code, a, u))
+        conn.commit()
+        send(peer_id, f"✅ Промокод создан\n\n{promo_card(code, a, 0, u)}")
+        return
 
     # ============ МАФИЯ ============
     if cmd in ("/ивент","/мафия"):
@@ -2198,22 +2390,24 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/ghelp":
         if not is_owner(uid): return
         send(peer_id, build_help_owner(), kb_back()); return
-
-
-# ============ ПАГИНАЦИЯ БИЗНЕСОВ ============
+        # ============ ПАГИНАЦИЯ БИЗНЕСОВ ============
 def biz_page(peer_id, page):
     if page < 0: page = 0
     cur.execute("SELECT COUNT(*) FROM biz_types"); total = cur.fetchone()[0]
     pages = (total + 9) // 10
+    if pages == 0: return send(peer_id, "❌ Нет бизнесов", kb_back())
     if page >= pages: page = pages - 1
+    
     cur.execute("SELECT name,price,income FROM biz_types ORDER BY price LIMIT 10 OFFSET ?", (page*10,))
     rows = cur.fetchall()
     if not rows: return send(peer_id, "❌ Нет", kb_back())
+    
     txt = header(f"БИЗНЕСЫ ({page+1}/{pages})")+f"\n\n"
     for n,p,i in rows:
         ib = int(i * style_bonus())
         txt += f"  🏢 {n}\n     💰 {fmt(p)} | 🏦 {fmt(ib)}/24ч\n\n"
     txt += f"{style_div()}\n📝 /купбиз <название>"
+    
     send(peer_id, txt, kb([
         [kbc("◀️ Назад", f"/списокбиз_{page-1}", "secondary"),
          kbc("Вперёд ▶️", f"/списокбиз_{page+1}", "primary")],
@@ -2221,6 +2415,7 @@ def biz_page(peer_id, page):
     ]))
 
 
+# ============ ВХОД В ЧАТ ============
 def handle_chat_invite(peer_id, member_id):
     if is_banned(member_id):
         ch = peer_to_chat(peer_id)
@@ -2238,11 +2433,15 @@ def handle_chat_invite(peer_id, member_id):
 def main():
     global vk, longpoll
     log("⚔️ Бот запускается...")
+    
+    # Защита: если longpoll не создан при импорте — создаём здесь
     if longpoll is None or vk is None:
         log("📡 Повторная инициализация VK в main()...")
         if not _init_vk():
             log("❌ Не удалось инициализировать VK"); return
+
     try:
+        # Выдаём права создателю и владельцам
         get_user(MAIN_OWNER)
         for ow in OWNERS:
             try:
@@ -2250,50 +2449,72 @@ def main():
                 cur.execute("UPDATE users SET role='Гл.Владелец', priority=101, balance=MAX(balance,999999999) WHERE user_id=?", (ow,))
             except: pass
         conn.commit()
+        
+        # Вывод статистики при старте
         cur.execute("SELECT COUNT(*) FROM biz_types"); bc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM countries"); cc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM cities"); ctc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM builds WHERE UPPER(type)='PIAR'"); pc = cur.fetchone()[0]
         log(f"🏢 Бизнесов: {bc} | 🌍 Стран: {cc} | 🏙 Городов: {ctc} | 📢 PIAR-чатов: {pc}")
         log(f"🎨 Стиль: {style_name()}")
-    except Exception as e: log(f"⚠️ {e}")
+    except Exception as e: 
+        log(f"⚠️ Ошибка при инициализации данных: {e}")
 
     log("🎧 Слушаю события...")
+    
+    # Запускаем фоновый поток авто-пиара
     threading.Thread(target=pr_resend_worker, daemon=True).start()
     log("🔁 Авто-пиар воркер запущен")
 
     while True:
         try:
             for event in longpoll.listen():
+                # Обработка нажатий на кнопки (Callback API)
                 if event.type == VkBotEventType.MESSAGE_EVENT:
                     try:
                         eid = event.object.event_id
                         ev_uid = event.object.user_id
                         ev_peer = event.object.peer_id
                         payload = event.object.payload
+                        
                         vk.messages.sendMessageEventAnswer(
                             event_id=eid, user_id=ev_uid, peer_id=ev_peer,
                             event_data=json.dumps({"type":"show_snackbar","text":"OK"}))
+                            
                         if isinstance(payload, dict) and payload.get("cmd"):
                             handle_message(ev_peer, ev_uid, payload["cmd"])
-                    except Exception as e: log(f"MEv: {e}")
+                    except Exception as e: 
+                        log(f"❌ Callback Error: {e}")
                     continue
-                if event.type != VkBotEventType.MESSAGE_NEW: continue
+                
+                # Обработка новых сообщений
+                if event.type != VkBotEventType.MESSAGE_NEW: 
+                    continue
+                    
                 msg = event.object.message
                 peer_id = msg['peer_id']; uid = msg['from_id']
                 message_id = msg['id']; text = msg.get('text','')
                 action = msg.get('action')
+                
+                # Обработка вступления в чат
                 if action:
                     if action.get('type') in ('chat_invite_user','chat_invite_user_by_link'):
                         member = action.get('member_id')
-                        if member and member > 0: handle_chat_invite(peer_id, member)
+                        if member and member > 0: 
+                            handle_chat_invite(peer_id, member)
                     continue
-                if not text: continue
-                try: handle_message(peer_id, uid, text, message_id, msg)
+                    
+                if not text: 
+                    continue
+                    
+                try: 
+                    handle_message(peer_id, uid, text, message_id, msg)
                 except Exception as e:
-                    log(f"❌ Handler: {e}"); traceback.print_exc(file=sys.stdout)
+                    log(f"❌ Handler Error: {e}")
+                    traceback.print_exc(file=sys.stdout)
+                    
         except Exception as e:
-            log(f"❌ LongPoll: {type(e).__name__}: {e}")
+            log(f"❌ LongPoll Error: {type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stdout)
             time.sleep(3)
 
