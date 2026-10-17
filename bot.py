@@ -9,10 +9,7 @@ def log(msg):
     print(msg, flush=True); sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
-# Токен лучше держать в env-переменной VK_TOKEN на Bothost.
-# FALLBACK_TOKEN — только для локального теста. Пустая строка = не используется.
-FALLBACK_TOKEN = ""
-
+FALLBACK_TOKEN = ""  # Токен лучше держать в переменной окружения VK_TOKEN на Bothost
 TOKEN = os.getenv("VK_TOKEN") or FALLBACK_TOKEN
 GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
 MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
@@ -28,15 +25,6 @@ OWNERS.add(1054352381)
 log(f"👑 Владельцы: {sorted(OWNERS)}")
 
 HOUR = 3600
-PR_TARIFFS_LIST = [
-    ("1 час", 100, HOUR, "Пиар 1 час"),
-    ("1 день", 500, HOUR*24, "Пиар 1 день"),
-    ("7 дней", 1000, HOUR*24*7, "Пиар 7 дней"),
-    ("Месяц", 2500, HOUR*24*30, "Пиар месяц"),
-    ("Год", 5000, HOUR*24*365, "Пиар год"),
-    ("Бессрочно", 10000, 0, "Пиар вечно"),
-]
-
 STYLES = {
     "обычный": {"emoji":"⚔️","div":"▬","name":"Обычный","bonus":1.0},
     "хэллоуин": {"emoji":"🎃","div":"🎃","name":"Хэллоуин","bonus":1.5},
@@ -47,7 +35,6 @@ STYLES = {
 }
 CURRENT_STYLE = "обычный"
 
-# ============ КОНСТАНТЫ ИГР ============
 RAID_COST = 50000
 RAID_COOLDOWN = 3600
 RAID_SUCCESS_CHANCE = 0.40
@@ -254,16 +241,6 @@ def init_db():
     ]
     for b, p, i in biz:
         try: cur.execute("INSERT OR IGNORE INTO biz_types(name,price,income) VALUES(?,?,?)", (b,p,i))
-        except: pass
-
-    try:
-        cur.execute("DELETE FROM pr_tariffs WHERE name IN ('Малый','Средний','Большой','VIP')")
-        conn.commit()
-    except: pass
-    for n, p, d, desc in PR_TARIFFS_LIST:
-        try:
-            cur.execute("INSERT OR IGNORE INTO pr_tariffs(name,price,duration,description) VALUES(?,?,?,?)",
-                        (n, p, d, desc))
         except: pass
 
     conn.commit()
@@ -508,7 +485,6 @@ def is_president(uid):
     if not c: return False
     co = get_country(c)
     if not co: return False
-    # co[2] = owner, co[3] = president
     return co[3] == uid or co[2] == uid
 def is_government(uid): return get_position(uid) in ('Президент','Министр','Генерал','Губернатор')
 
@@ -611,6 +587,14 @@ def get_report_chat():
     r = cur.fetchone()
     return r[0] if r else None
 
+# ============ ССЫЛКА НА ЧАТ ДЛЯ АДМИНОВ ============
+def get_chat_link(peer_id):
+    if peer_id >= 2000000000:
+        cid = peer_id - 2000000000
+    else:
+        cid = peer_id
+    return f"https://m.vk.ru/gim{GROUP_ID}/convo/{cid}?entrypoint=list_all"
+
 # ============ КЛАВИАТУРЫ ============
 def header(t):
     cfg = style_cfg(); div = cfg["div"] * 16
@@ -637,7 +621,7 @@ def kb_main():
         [kbt("🏙 Города","/моигорода","secondary"), kbt("🏴 Налёт","/налёт","negative")],
         [kbt("💼 Работы","/работы"), kbt("🏢 Бизнесы","/списокбиз")],
         [kbt("🏆 Уровень","/уровень","positive"), kbt("🎖️ Титул","/мтитул","primary")],
-        [kbt("📢 Пиар","/пиар","positive"), kbt("🔁 Авто-пиар","/пиар_авто","positive")],
+        [kbt("📢 Пиар","/пиар","positive")],
         [kbt("🆘 Помощь","/help","secondary")],
         [kbt("📊 Моя стата","/мойстат","secondary")],
     ])
@@ -722,7 +706,7 @@ def promo_card(code, amount, uses, max_uses):
         f"  📊 ➜ Осталось: {left}\n"
         f"  {status}\n\n"
         f"{style_div()}"
-         )
+                                   )
     # ============ ИГРЫ ============
 def play_game(peer_id, uid, game, bet):
     if bet <= 0: return send(peer_id, "❌ Ставка > 0")
@@ -857,7 +841,7 @@ def build_help_user():
   /паспорт /казна /граждане /армия /города
 
 📢 СОЦИАЛЬНОЕ
-  /пиар /пиар_авто /pr_my /promo /подписка /донат
+  /пиар /pr_my /promo /подписка /донат
   /report /offer /ивент /мафия /ежедневно
 
 🎟️ /promo <код> — активировать промокод
@@ -1069,10 +1053,10 @@ def do_raid(peer_id, uid, city_name):
                 f"💸 Потеряно: {fmt(taken)} 💵")
         except: pass
 
-# ============ АВТО-ПИАР ============
+# ============ ПИАР (НОВЫЕ ЦЕНЫ) ============
 def pr_auto_price(minutes):
-    """1 мин = 50₽, 2 мин = 55₽, ..., 20 мин = 145₽"""
-    return 45 + 5 * minutes
+    """20 мин = 50₽, 19 мин = 100₽, ..., 1 мин = 1000₽"""
+    return 1050 - 50 * minutes
 
 def pr_send_to_piar_chats(body):
     """Рассылка текста ТОЛЬКО в PIAR-чаты. Возвращает кол-во отправленных."""
@@ -1087,7 +1071,7 @@ def pr_send_to_piar_chats(body):
     return sent
 
 def pr_resend_worker():
-    """Фоновый поток: каждые 30 сек проверяет, пора ли повторить авто-пиар."""
+    """Фоновый поток: каждые 30 сек проверяет, пора ли повторить пиар."""
     time.sleep(15)
     while True:
         try:
@@ -1113,7 +1097,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     text = text.strip(); low = text.lower()
     if low in TEXT_ALIASES: text = TEXT_ALIASES[low]
 
-    # ПИАР-ТЕКСТ
+    # ПИАР-ТЕКСТ (ожидание текста от владельца)
     gs_pr = get_game_state(uid)
     if gs_pr and gs_pr.startswith("pr_text:") and not text.startswith("/"):
         try: oid = int(gs_pr.split(":")[1])
@@ -1203,79 +1187,42 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if res: send(peer_id, res)
         return
 
-    # ============ АВТО-ПИАР ============
-    if cmd in ("/пиар_авто","/pr_auto"):
-        txt = f"{header('📢 АВТО-ПИАР')}\n\n  🤖 Рассылка в PIAR-чаты каждые N минут\n\n  💰 ПРАЙС:\n\n"
+    # ============ ПИАР ============
+    if cmd in ("/пиар","/pr"):
+        txt = f"{header('📢 ПИАР')}\n\n  💰 Оплата через владельца\n  📢 Рассылка только в PIAR-чаты\n\n  ⏱ ВЫБЕРИТЕ ИНТЕРВАЛ:\n\n"
         btns = []; row = []
         for n in range(1, 21):
             pr = pr_auto_price(n)
             txt += f"  ⏱ {n} мин — {pr} ₽\n"
-            row.append(kbc(f"{n}м|{pr}₽", f"/pr_avto {n}", "primary"))
-            if len(row) == 5: btns.append(row); row = []
+            row.append(kbc(f"{n}м | {pr}₽", f"/pr_buy_auto {n}", "primary"))
+            if len(row) == 4: btns.append(row); row = []
         if row: btns.append(row)
         btns.append([kbc("📋 Мои заказы","/pr_my","secondary")])
         send(peer_id, txt + f"\n{style_div()}\n📝 @id{MAIN_OWNER}", kb(btns)); return
 
-    if cmd == "/pr_avto":
-        if len(args) < 2: return send(peer_id, "📝 /pr_avto <1-20>")
+    if cmd == "/pr_buy_auto":
+        if len(args) < 2: return
         try: n = int(args[1])
-        except: return send(peer_id, "❌ Число 1-20")
-        if n < 1 or n > 20: return send(peer_id, "❌ Интервал 1-20 минут")
+        except: return
+        if n < 1 or n > 20: return
         price = pr_auto_price(n)
         cur.execute("""INSERT INTO pr_orders(user_id,tariff,price,status,created,duration,interval_min)
                        VALUES(?,?,?,?,?,?,?)""",
-                    (uid, f"Авто {n} мин", price, "wait_pay", int(time.time()), 0, n))
+                    (uid, f"Пиар {n} мин", price, "wait_pay", int(time.time()), 0, n))
         conn.commit(); oid = cur.lastrowid
-        send(peer_id, card("📢 АВТО-ПИАР ЗАКАЗ", [
+        send(peer_id, card("📢 ЗАКАЗ ПИАРА", [
             ("🔢",f"#{oid}"),("⏱ Интервал",f"каждые {n} мин"),
             ("💰",f"{price} ₽"),("❓","🟡 Ожидает оплаты"),
         ], f"💳 @id{MAIN_OWNER}"))
-        if peer_id >= 2000000000:
-            link = f"https://vk.com/im?sel=c{peer_id-2000000000}"
-        else:
-            link = f"https://vk.com/id{uid}"
-        notif = (f"📢 НОВЫЙ АВТО-ПИАР ЗАКАЗ #{oid}\n\n"
+        
+        link = get_chat_link(peer_id)
+        notif = (f"📢 НОВЫЙ ЗАКАЗ ПИАРА #{oid}\n\n"
                  f"  👤 Покупатель: {mention(uid)}\n"
                  f"  🔗 Ссылка на чат: {link}\n"
                  f"  ⏱ Интервал: каждые {n} мин\n"
                  f"  💰 Сумма: {price} ₽\n\n"
                  f"✅ /pr_ok {oid}\n❌ /pr_no {oid}")
         for ow in OWNERS: send_uid(ow, notif)
-        return
-
-    # ============ ПИАР ============
-    if cmd in ("/пиар","/pr"):
-        cur.execute("SELECT name, price, duration, description FROM pr_tariffs ORDER BY price")
-        rows = cur.fetchall()
-        if not rows: return send(peer_id, "❌ Тарифы не настроены")
-        txt = f"{header('📢 ПИАР')}\n\n  💰 Оплата через владельца\n  📢 Рассылка только в PIAR-чаты\n\n  📋 ТАРИФЫ:\n\n"
-        btn = []
-        for n, p, d, desc in rows:
-            txt += f"  📦 {n} — {p} ₽\n     {desc}\n\n"
-            btn.append([kbc(f"📦 {n} — {p} ₽", f"/pr_buy {n}", "primary")])
-        btn.append([kbc("🔁 Авто-пиар","/пиар_авто","positive")])
-        btn.append([kbc("📋 Мои заказы","/pr_my","secondary")])
-        send(peer_id, txt + f"{style_div()}\n📝 @id{MAIN_OWNER}", kb(btn)); return
-
-    if cmd.startswith("/pr_buy"):
-        parts = cmd.split(maxsplit=1)
-        tn = parts[1].strip() if len(parts) > 1 else (" ".join(args[1:]) if len(args)>1 else None)
-        if not tn: return send(peer_id, "📝 /pr_buy <тариф>")
-        cur.execute("SELECT name, price, duration, description FROM pr_tariffs WHERE name=?", (tn,))
-        t = cur.fetchone()
-        if not t: return send(peer_id, f"❌ Тариф «{tn}» не найден")
-        cur.execute("INSERT INTO pr_orders(user_id,tariff,price,status,created,duration) VALUES(?,?,?,?,?,?)",
-                    (uid, t[0], t[1], "wait_pay", int(time.time()), t[2]))
-        conn.commit(); oid = cur.lastrowid
-        send(peer_id, card("📢 ЗАКАЗ ПИАРА", [
-            ("🔢",f"#{oid}"),("📦",t[0]),("💰",f"{t[1]} ₽"),("❓","🟡 Ожидает оплаты")
-        ], f"💳 @id{MAIN_OWNER}"))
-        if peer_id >= 2000000000:
-            link = f"https://vk.com/im?sel=c{peer_id-2000000000}"
-        else:
-            link = f"https://vk.com/id{uid}"
-        for ow in OWNERS:
-            send_uid(ow, f"📢 ЗАКАЗ #{oid}\n👤 {mention(uid)}\n🔗 {link}\n📦 {t[0]}\n💰 {t[1]} ₽\n\n✅ /pr_ok {oid}\n❌ /pr_no {oid}")
         return
 
     if cmd == "/pr_my":
@@ -1294,7 +1241,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, txt + f"\n{style_div()}"); return
 
     if cmd == "/pr_ok":
-        if not is_owner(uid): return
+        if not (uid in OWNERS or get_priority(uid) >= 100): return
         if len(args) < 2: return
         try: oid = int(args[1])
         except: return
@@ -1309,7 +1256,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send_uid(o[0], f"✅ Заказ #{oid} подтверждён!"); return
 
     if cmd == "/pr_no":
-        if not is_owner(uid): return
+        if not (uid in OWNERS or get_priority(uid) >= 100): return
         if len(args) < 2: return
         try: oid = int(args[1])
         except: return
