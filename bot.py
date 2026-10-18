@@ -11,7 +11,7 @@ def log(msg):
     print(msg, flush=True); sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
-FALLBACK_TOKEN = ""  # Вставь сюда токен ИЛИ задай env VK_TOKEN на Bothost
+FALLBACK_TOKEN = "vk1.a.SVQdRwpzCey4t3rSA8ygRG7KM58ZndwlFqEoWIVnu1AWzrzVOGuR-IpRKgmcuBfV5ZGwp9_5oMxBAx_On4346ambCyJh42ZCFKJCjCx3i7L3i6eEfdyjQsicFj8WIgxKE2HeY136KmaRHbJCeSRnG_XnrWrJx-9mfC0gt5ErVXXn0yOPC1HuZzuhAufNZ0ulyw70-z9n-23RWKRmF8ZZCg"  # Вставь сюда токен ИЛИ задай env VK_TOKEN на Bothost
 TOKEN = os.getenv("VK_TOKEN") or FALLBACK_TOKEN
 GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
 MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
