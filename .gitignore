@@ -1,9 +1,7 @@
-__pycache__/
-*.pyc
-*.pyo
 bot.db
 *.db
+__pycache__/
+*.pyc
 .env
-venv/
-.idea/
-.vscode/
+stats_*.png
+stats.png
