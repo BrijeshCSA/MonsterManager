@@ -5,6 +5,7 @@ from vk_api.utils import get_random_id
 import sqlite3, random, time, json, os, sys, traceback, threading
 from datetime import datetime
 from collections import deque
+import requests
 
 def log(msg):
     print(msg, flush=True); sys.stdout.flush()
@@ -47,7 +48,7 @@ MAT_ROOTS = (
     "долбоеб","долбоёб","залуп","шлюх","шалав","fuck","shit","bitch","cunt","dick","pussy","asshole",
 )
 
-# ============ БАЗА ============
+# ============ БАЗА ДАННЫХ ============
 conn = sqlite3.connect('bot.db', check_same_thread=False)
 cur = conn.cursor()
 
@@ -253,38 +254,22 @@ def _add_col(table, col, dfn):
         except: pass
 
 for t, c, d in [
-    ("users","priority","INTEGER DEFAULT 0"),
-    ("users","exp","INTEGER DEFAULT 0"),
-    ("users","level","INTEGER DEFAULT 0"),
-    ("users","work","TEXT"),
-    ("users","work_last","INTEGER DEFAULT 0"),
-    ("users","password","TEXT"),
-    ("users","exp_last","INTEGER DEFAULT 0"),
-    ("users","title","TEXT"),
-    ("users","rep","INTEGER DEFAULT 0"),
-    ("users","daily","INTEGER DEFAULT 0"),
-    ("users","mute_notify","INTEGER DEFAULT 0"),
-    ("users","bank","INTEGER DEFAULT 0"),
-    ("jobs","min_exp","INTEGER DEFAULT 0"),
-    ("roles","emoji","TEXT DEFAULT '🎭'"),
-    ("builds","type","TEXT DEFAULT 'chat'"),
-    ("pr_orders","duration","INTEGER DEFAULT 0"),
-    ("pr_orders","expires_at","INTEGER DEFAULT 0"),
-    ("cities","last_collect","INTEGER DEFAULT 0"),
-    ("users","raid_last","INTEGER DEFAULT 0"),
-    ("users","msg_count","INTEGER DEFAULT 0"),
-    ("users","mat_count","INTEGER DEFAULT 0"),
-    ("users","captures","INTEGER DEFAULT 0"),
-    ("pr_orders","interval_min","INTEGER DEFAULT 0"),
-    ("pr_orders","last_resend","INTEGER DEFAULT 0"),
-    ("users","married_to","INTEGER DEFAULT 0"),
-    ("users","married_date","INTEGER DEFAULT 0"),
-    ("users","aevent_last","INTEGER DEFAULT 0"),
-    ("users","drone_last","INTEGER DEFAULT 0"),
-    ("users","vip_until","INTEGER DEFAULT 0"),
-    ("users","drone_mult","INTEGER DEFAULT 1"),
-    ("users","drone_name","TEXT"),
-    ("users","daily_case_last","INTEGER DEFAULT 0"),
+    ("users","priority","INTEGER DEFAULT 0"),("users","exp","INTEGER DEFAULT 0"),
+    ("users","level","INTEGER DEFAULT 0"),("users","work","TEXT"),
+    ("users","work_last","INTEGER DEFAULT 0"),("users","password","TEXT"),
+    ("users","exp_last","INTEGER DEFAULT 0"),("users","title","TEXT"),
+    ("users","rep","INTEGER DEFAULT 0"),("users","daily","INTEGER DEFAULT 0"),
+    ("users","mute_notify","INTEGER DEFAULT 0"),("users","bank","INTEGER DEFAULT 0"),
+    ("jobs","min_exp","INTEGER DEFAULT 0"),("roles","emoji","TEXT DEFAULT '🎭'"),
+    ("builds","type","TEXT DEFAULT 'chat'"),("pr_orders","duration","INTEGER DEFAULT 0"),
+    ("pr_orders","expires_at","INTEGER DEFAULT 0"),("cities","last_collect","INTEGER DEFAULT 0"),
+    ("users","raid_last","INTEGER DEFAULT 0"),("users","msg_count","INTEGER DEFAULT 0"),
+    ("users","mat_count","INTEGER DEFAULT 0"),("users","captures","INTEGER DEFAULT 0"),
+    ("pr_orders","interval_min","INTEGER DEFAULT 0"),("pr_orders","last_resend","INTEGER DEFAULT 0"),
+    ("users","married_to","INTEGER DEFAULT 0"),("users","married_date","INTEGER DEFAULT 0"),
+    ("users","aevent_last","INTEGER DEFAULT 0"),("users","drone_last","INTEGER DEFAULT 0"),
+    ("users","vip_until","INTEGER DEFAULT 0"),("users","drone_mult","INTEGER DEFAULT 1"),
+    ("users","drone_name","TEXT"),("users","daily_case_last","INTEGER DEFAULT 0"),
 ]:
     _add_col(t, c, d)
     # ============ СТИЛЬ ============
@@ -625,6 +610,72 @@ def get_chat_link(peer_id):
     if peer_id >= 2000000000: cid = peer_id - 2000000000
     else: cid = peer_id
     return f"https://m.vk.ru/gim{GROUP_ID}/convo/{cid}?entrypoint=list_all"
+
+# ============ ОТПРАВКА КАРТИНКИ /СТАТА ============
+def vk_upload_photo(peer_id, file_path):
+    try:
+        server = vk.photos.getMessagesUploadServer(peer_id=peer_id)
+        with open(file_path, "rb") as f:
+            resp = requests.post(server["upload_url"], files={"photo": ("stats.png", f)}).json()
+        saved = vk.photos.saveMessagesPhoto(photo=resp["photo"], server=resp["server"], hash=resp["hash"])
+        p = saved[0]
+        return f"photo{p['owner_id']}_{p['id']}"
+    except Exception as e:
+        log(f"❌ vk_upload_photo: {e}")
+        return None
+
+_stats_cache = {}
+STATS_CACHE_TTL = 300
+
+def build_stats_user_dict(uid, chat_id=None):
+    lvl = ulevel(uid); exp = uexp(uid)
+    need = (lvl + 1) * 100
+    pct = int((exp / need) * 100) if need else 0
+    m_to = umarried_to(uid)
+    partner = name_of(m_to) if m_to else "нет"
+    pos = get_position(uid) or "—"
+    cur.execute("SELECT role FROM user_roles WHERE user_id=? AND chat_id=?", (uid, chat_id or 0))
+    ur = cur.fetchone()
+    chat_role = ur[0] if ur else "Участник"
+    status = get_title(lvl)
+    status_emoji = get_priority_emoji(get_priority(uid))
+    return {
+        "title": pos, "priv": "Игрок", "vip": is_vip(uid),
+        "role": chat_role, "priority": get_priority(uid), "msgs": umsg_count(uid),
+        "lvl": lvl, "lvl_max": 999, "xp": exp, "xp_max": need, "xp_pct": pct,
+        "warns": uwarns(uid), "marriage": partner, "rep": urep(uid),
+        "nick": ufield(uid, "nick") or "не установлен", "gift": udrone_name(uid) or "—",
+        "status": status, "status_emoji": status_emoji,
+    }
+
+def send_stats_card(peer_id, uid, chat_id=None):
+    now = int(time.time())
+    cached = _stats_cache.get(uid)
+    if cached and now - cached[1] < STATS_CACHE_TTL:
+        try:
+            vk.messages.send(peer_id=peer_id, message="", random_id=get_random_id(), attachment=cached[0])
+            return True
+        except: pass
+    try:
+        from stats_card import render_card
+    except Exception as e:
+        log(f"⚠️ stats_card не загружен: {e}")
+        return False
+    try:
+        u = build_stats_user_dict(uid, chat_id)
+        bg_url = "https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg"
+        path = render_card(bg_url, u, out_path=f"stats_{uid}.png")
+        att = vk_upload_photo(peer_id, path)
+        if not att: return False
+        _stats_cache[uid] = (att, now)
+        vk.messages.send(peer_id=peer_id, message="", random_id=get_random_id(), attachment=att)
+        try: os.remove(path)
+        except: pass
+        return True
+    except Exception as e:
+        log(f"❌ send_stats_card: {e}")
+        traceback.print_exc(file=sys.stdout)
+        return False
 
 # ============ КЛАВИАТУРЫ ============
 def header(t):
@@ -1705,6 +1756,12 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     # ============ СТАТА ============
     if cmd == "/стата":
         t = extract_uid(args[1] if len(args)>1 else None, event_msg) or uid
+        
+        # Пытаемся отправить картинку
+        if send_stats_card(peer_id, t, chat_id):
+            return
+            
+        # Если картинка не удалась (нет библиотек) — шлём текст
         lvl = ulevel(t); exp = uexp(t); need = (lvl+1)*100
         prog = get_progress_bar(exp, need, 8)
         pct = int((exp/need)*100) if need > 0 else 0
