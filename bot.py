@@ -10,7 +10,7 @@ def log(msg):
     print(msg, flush=True); sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
-FALLBACK_TOKEN = ""  # Вставь токен здесь ИЛИ задай переменную окружения VK_TOKEN
+FALLBACK_TOKEN = ""  # Вставь сюда токен ИЛИ задай env VK_TOKEN на Bothost
 TOKEN = os.getenv("VK_TOKEN") or FALLBACK_TOKEN
 GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
 MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
@@ -70,29 +70,17 @@ def init_db():
         name TEXT UNIQUE, country TEXT, owner INTEGER, level INTEGER DEFAULT 1,
         population INTEGER DEFAULT 10000, income INTEGER DEFAULT 5000,
         defense INTEGER DEFAULT 1000, is_capital INTEGER DEFAULT 0, last_collect INTEGER DEFAULT 0)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS giveaways(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        amount INTEGER, expire INTEGER, text TEXT, creator INTEGER, taken_by INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS promos(code TEXT PRIMARY KEY, amount INTEGER,
         uses INTEGER, max_uses INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS bans(user_id INTEGER PRIMARY KEY, reason TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS wars(id INTEGER PRIMARY KEY AUTOINCREMENT,
         attacker TEXT, defender TEXT, started INTEGER, active INTEGER DEFAULT 1)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS coalitions(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT, leader INTEGER, members TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS elections(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        country TEXT, active INTEGER DEFAULT 1, started INTEGER)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS candidates(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        election_id INTEGER, user_id INTEGER, votes INTEGER DEFAULT 0)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS votes(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        election_id INTEGER, voter INTEGER, candidate INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS members(user_id INTEGER PRIMARY KEY, country TEXT,
         position TEXT DEFAULT 'Гражданин')""")
     cur.execute("""CREATE TABLE IF NOT EXISTS companies(id INTEGER PRIMARY KEY AUTOINCREMENT,
         owner INTEGER, country TEXT, name TEXT, type TEXT, income INTEGER DEFAULT 1000)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS stockpile(country TEXT PRIMARY KEY, food INTEGER DEFAULT 0,
         weapons INTEGER DEFAULT 0, resources INTEGER DEFAULT 0, fuel INTEGER DEFAULT 0, money INTEGER DEFAULT 0)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS transports(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        owner INTEGER, type TEXT, count INTEGER DEFAULT 0)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS country_army(country TEXT PRIMARY KEY,
         troops INTEGER DEFAULT 0, pvo INTEGER DEFAULT 0, rockets INTEGER DEFAULT 0, drones INTEGER DEFAULT 0)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS nicks(user_id INTEGER PRIMARY KEY, nick TEXT)""")
@@ -103,8 +91,6 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS global_roles(user_id INTEGER PRIMARY KEY, role TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS builds(chat_id INTEGER PRIMARY KEY, peer_id INTEGER,
         title TEXT, type TEXT DEFAULT 'chat', linked_by INTEGER, linked_at INTEGER)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS cmd_perms(user_id INTEGER, command TEXT,
-        PRIMARY KEY(user_id, command))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS bot_disabled(peer_id INTEGER PRIMARY KEY, since INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS game_state(user_id INTEGER PRIMARY KEY, game TEXT, ts INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS chat_silence(chat_id INTEGER PRIMARY KEY, min_priority INTEGER)""")
@@ -118,8 +104,6 @@ def init_db():
         created INTEGER, answered_by INTEGER, answered INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY, value TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS report_chats(peer_id INTEGER PRIMARY KEY, linked_by INTEGER, linked_at INTEGER)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS pr_tariffs(id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE, price INTEGER, duration INTEGER, description TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS pr_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, tariff TEXT, price INTEGER, text TEXT, status TEXT DEFAULT 'wait_pay',
         created INTEGER, paid_at INTEGER, confirmed_by INTEGER, sent_at INTEGER,
@@ -269,16 +253,23 @@ def _add_col(table, col, dfn):
         except: pass
 
 for t, c, d in [
-    ("countries","last_mob","INTEGER DEFAULT 0"),("countries","points","INTEGER DEFAULT 0"),
-    ("users","points","INTEGER DEFAULT 0"),("users","exp","INTEGER DEFAULT 0"),
-    ("users","level","INTEGER DEFAULT 0"),("users","priority","INTEGER DEFAULT 0"),
-    ("users","work","TEXT"),("users","work_last","INTEGER DEFAULT 0"),
-    ("users","password","TEXT"),("users","exp_last","INTEGER DEFAULT 0"),
-    ("users","title","TEXT"),("users","rep","INTEGER DEFAULT 0"),
-    ("users","daily","INTEGER DEFAULT 0"),("users","mute_notify","INTEGER DEFAULT 0"),
-    ("users","bank","INTEGER DEFAULT 0"),("jobs","min_exp","INTEGER DEFAULT 0"),
-    ("roles","emoji","TEXT DEFAULT '🎭'"),("builds","type","TEXT DEFAULT 'chat'"),
-    ("pr_orders","duration","INTEGER DEFAULT 0"),("pr_orders","expires_at","INTEGER DEFAULT 0"),
+    ("users","priority","INTEGER DEFAULT 0"),
+    ("users","exp","INTEGER DEFAULT 0"),
+    ("users","level","INTEGER DEFAULT 0"),
+    ("users","work","TEXT"),
+    ("users","work_last","INTEGER DEFAULT 0"),
+    ("users","password","TEXT"),
+    ("users","exp_last","INTEGER DEFAULT 0"),
+    ("users","title","TEXT"),
+    ("users","rep","INTEGER DEFAULT 0"),
+    ("users","daily","INTEGER DEFAULT 0"),
+    ("users","mute_notify","INTEGER DEFAULT 0"),
+    ("users","bank","INTEGER DEFAULT 0"),
+    ("jobs","min_exp","INTEGER DEFAULT 0"),
+    ("roles","emoji","TEXT DEFAULT '🎭'"),
+    ("builds","type","TEXT DEFAULT 'chat'"),
+    ("pr_orders","duration","INTEGER DEFAULT 0"),
+    ("pr_orders","expires_at","INTEGER DEFAULT 0"),
     ("cities","last_collect","INTEGER DEFAULT 0"),
     ("users","raid_last","INTEGER DEFAULT 0"),
     ("users","msg_count","INTEGER DEFAULT 0"),
@@ -1195,8 +1186,6 @@ def show_cases_menu(peer_id, uid):
     send(peer_id, txt, kb(btns))
 
 # ============ АДМИН-ИВЕНТ ============
-DRONE_PRIZES = RUSSIAN_DRONES + OTHER_DRONES
-
 def play_admin_event(peer_id, uid, chat_id):
     if get_priority(uid) < 20:
         return send(peer_id, "❌ Ивент доступен только администрации (20+)")
@@ -1888,7 +1877,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             return send(peer_id, f"📝 /налёт <название города>\n\n  💰 Стоимость: {fmt(RAID_COST)} 💵\n  🎯 Шанс успеха: 40%\n  🏆 Добыча: 20% от дохода города\n  ⏳ Кулдаун: 1 час", kb_country())
         return do_raid(peer_id, uid, " ".join(args[1:]))
 
-    # ============ ВОЙНА / ПРЕЗИДЕНТ / ДОЛЖНОСТИ ============
+    # ============ ВОЙНА / ПРЕЗИДЕНТ ============
     if cmd == "/война":
         c = ucountry(uid)
         if not c: return send(peer_id, "❌ Ты не гражданин страны")
@@ -1955,7 +1944,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: pass
         return
 
-    # ============ ТИКЕТЫ И ПРИВЯЗКИ ============
+    # ============ ТИКЕТЫ ============
     if cmd == "/report":
         if len(args) < 2: return send(peer_id, "📝 /report <текст>")
         tm = " ".join(args[1:])
@@ -2007,6 +1996,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         elif t[1] == "offer": inc_admin_stat(uid, "offers")
         send_uid(t[0], f"📩 ОТВЕТ #{tid}\n\n{ans}"); send(peer_id, "✅"); return
 
+    # ============ ПРИВЯЗКА ЧАТОВ ============
     if cmd == "/build":
         if not is_owner(uid): return
         if len(args) >= 2 and args[1].lower() == "report":
@@ -2346,6 +2336,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("UPDATE pr_orders SET status='cancelled' WHERE id=?", (oid,)); conn.commit()
         send(peer_id, f"❌ #{oid} отменён"); send_uid(o[0], f"❌ Заказ #{oid} отклонён"); return
 
+    # ============ РОЛИ ============
     if cmd == "/role":
         cur.execute("SELECT name,priority,emoji FROM roles ORDER BY priority DESC"); rows = cur.fetchall()
         txt = header("РОЛИ")+"\n\n"
