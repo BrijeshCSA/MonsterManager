@@ -1,4 +1,61 @@
-# -*- coding: utf-8 -*-
+# ============ ДИАГНОСТИКА ============
+def _startup_diagnostics():
+    # Скачиваем шрифты с надежного CDN
+    fonts = {
+        "font_regular.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Regular.ttf",
+        "font_bold.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Bold.ttf"
+    }
+    for name, url in fonts.items():
+        # Проверяем, что файла нет или он битый (меньше 100 КБ)
+        if not os.path.exists(name) or os.path.getsize(name) < 100000:
+            try:
+                log(f"⏳ Скачивание {name}...")
+                resp = requests.get(url, timeout=20) # <-- Теперь requests берется из глобальной области видимости
+                if resp.status_code == 200:
+                    with open(name, "wb") as f:
+                        f.write(resp.content)
+                    log(f"✅ Скачан шрифт: {name} ({os.path.getsize(name)} байт)")
+                else:
+                    log(f"❌ Ошибка скачивания {name}: статус {resp.status_code}")
+            except Exception as e:
+                log(f"❌ Ошибка скачивания {name}: {e}")
+
+    log("🔍 ПРОВЕРКА ОКРУЖЕНИЯ:")
+    try:
+        from PIL import Image, ImageFont
+        log("   ✅ Pillow установлен")
+        # Проверяем, что шрифт реально читается
+        if os.path.exists("font_regular.ttf") and os.path.getsize("font_regular.ttf") > 100000:
+            test_font = ImageFont.truetype("font_regular.ttf", 20)
+            log("   ✅ Шрифт успешно загружен в Pillow")
+        else:
+            log("   ❌ Шрифт не найден локально!")
+    except Exception as e:
+        log(f"   ❌ Ошибка Pillow/шрифта: {e}")
+        
+    try:
+        # Просто проверяем, что модуль доступен глобально
+        _ = requests.__version__
+        log("   ✅ requests установлен")
+    except Exception as e:
+        log(f"   ❌ requests НЕ установлен: {e}")
+        
+    try:
+        import stats_card
+        log("   ✅ stats_card.py загружен")
+    except Exception as e:
+        log(f"   ❌ stats_card.py НЕ загружен: {e}")
+        
+    try:
+        from stats_card import render_card
+        test = render_card("https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg",
+                           {"name": "Тест", "title":"Test"}, out_path="test_stats.png")
+        if os.path.exists(test):
+            log(f"   ✅ Тестовая карточка: {test} ({os.path.getsize(test)} байт)")
+            try: os.remove(test)
+            except: pass
+    except Exception as e:
+        log(f"   ❌ Тест render_card: {e}")# -*- coding: utf-8 -*-
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.utils import get_random_id
@@ -2690,8 +2747,7 @@ def handle_chat_invite(peer_id, member_id):
         if role:
             try: send(peer_id, f"🎭 {mention(member_id)} — *{role}*")
             except: pass
-
-# ============ ДИАГНОСТИКА ============
+                # ============ ДИАГНОСТИКА ============
 def _startup_diagnostics():
     # Скачиваем шрифты с надежного CDN
     fonts = {
@@ -2703,7 +2759,7 @@ def _startup_diagnostics():
         if not os.path.exists(name) or os.path.getsize(name) < 100000:
             try:
                 log(f"⏳ Скачивание {name}...")
-                resp = requests.get(url, timeout=20)
+                resp = requests.get(url, timeout=20) # <-- Теперь requests берется из глобальной области видимости
                 if resp.status_code == 200:
                     with open(name, "wb") as f:
                         f.write(resp.content)
@@ -2717,7 +2773,8 @@ def _startup_diagnostics():
     try:
         from PIL import Image, ImageFont
         log("   ✅ Pillow установлен")
-        if os.path.exists("font_regular.ttf"):
+        # Проверяем, что шрифт реально читается
+        if os.path.exists("font_regular.ttf") and os.path.getsize("font_regular.ttf") > 100000:
             test_font = ImageFont.truetype("font_regular.ttf", 20)
             log("   ✅ Шрифт успешно загружен в Pillow")
         else:
@@ -2726,15 +2783,18 @@ def _startup_diagnostics():
         log(f"   ❌ Ошибка Pillow/шрифта: {e}")
         
     try:
-        import requests
+        # Просто проверяем, что модуль доступен глобально
+        _ = requests.__version__
         log("   ✅ requests установлен")
     except Exception as e:
         log(f"   ❌ requests НЕ установлен: {e}")
+        
     try:
         import stats_card
         log("   ✅ stats_card.py загружен")
     except Exception as e:
         log(f"   ❌ stats_card.py НЕ загружен: {e}")
+        
     try:
         from stats_card import render_card
         test = render_card("https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg",
@@ -2745,7 +2805,7 @@ def _startup_diagnostics():
             except: pass
     except Exception as e:
         log(f"   ❌ Тест render_card: {e}")
-
+        
 # ============ ЗАПУСК ============
 def main():
     global vk, longpoll
