@@ -2692,10 +2692,9 @@ def handle_chat_invite(peer_id, member_id):
                 # ============ ДИАГНОСТИКА ============
     def _startup_diagnostics():
     # Скачиваем шрифты в папку /app/data
-    DATA_DIR = os.getenv('DATA_DIR', '/app/data')
     fonts = {
-        os.path.join(DATA_DIR, "font_regular.ttf"): "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Regular.ttf",
-        os.path.join(DATA_DIR, "font_bold.ttf"): "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Bold.ttf"
+    os.path.join(DATA_DIR, "font_regular.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
+    os.path.join(DATA_DIR, "font_bold.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlfBBc9.ttf"
     }
     
     for name, url in fonts.items():
