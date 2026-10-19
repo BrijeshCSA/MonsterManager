@@ -4,7 +4,6 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 W, H = 1080, 1080
 
-# Определяем папку для данных (ту же, где лежит БД)
 DATA_DIR = os.getenv('DATA_DIR', '/app/data')
 if not os.path.exists(DATA_DIR):
     try: os.makedirs(DATA_DIR, exist_ok=True)
@@ -22,15 +21,14 @@ GREEN  = (140, 230, 160)
 
 SEP_LINE = "━━━━━━━━━━━━━━━━━━━━"
 
-# --- АВТОСКАЧИВАНИЕ ШРИФТОВ ---
 def ensure_fonts():
     fonts = {
-        FONT_PATH: "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
-        FONT_BOLD: "https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlfBBc9.ttf"
+        FONT_PATH: "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Regular.ttf",
+        FONT_BOLD: "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Bold.ttf"
     }
     for name, url in fonts.items():
-        # Если файла нет или он весит меньше 10 КБ (битый)
-        if not os.path.exists(name) or os.path.getsize(name) < 10000:
+        # Ждем файл > 100 КБ (полный шрифт)
+        if not os.path.exists(name) or os.path.getsize(name) < 100000:
             try:
                 print(f"⏳ Скачивание {name}...", flush=True)
                 resp = requests.get(url, timeout=20)
@@ -47,8 +45,7 @@ ensure_fonts()
 
 def _font(size, bold=False):
     path = FONT_BOLD if bold else FONT_PATH
-    # Проверяем размер > 10 КБ
-    if os.path.exists(path) and os.path.getsize(path) > 10000:
+    if os.path.exists(path) and os.path.getsize(path) > 100000:
         return ImageFont.truetype(path, size)
     
     try:
