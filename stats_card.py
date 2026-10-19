@@ -24,13 +24,13 @@ SEP_LINE = "━━━━━━━━━━━━━━━━━━━━"
 
 # --- АВТОСКАЧИВАНИЕ ШРИФТОВ ---
 def ensure_fonts():
-    fonts = fonts = {
-    FONT_PATH: "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
-    FONT_BOLD: "https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlfBBc9.ttf"
+    fonts = {
+        FONT_PATH: "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
+        FONT_BOLD: "https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlfBBc9.ttf"
     }
     for name, url in fonts.items():
-        # Если файла нет или он весит меньше 100 КБ (битый)
-        if not os.path.exists(name) or os.path.getsize(name) < 100000:
+        # Если файла нет или он весит меньше 10 КБ (битый)
+        if not os.path.exists(name) or os.path.getsize(name) < 10000:
             try:
                 print(f"⏳ Скачивание {name}...", flush=True)
                 resp = requests.get(url, timeout=20)
@@ -38,6 +38,8 @@ def ensure_fonts():
                     with open(name, "wb") as f:
                         f.write(resp.content)
                     print(f"✅ Скачан {name} ({os.path.getsize(name)} байт)", flush=True)
+                else:
+                    print(f"❌ Ошибка {resp.status_code} при скачивании {name}", flush=True)
             except Exception as e:
                 print(f"❌ Ошибка скачивания {name}: {e}", flush=True)
 
@@ -45,7 +47,8 @@ ensure_fonts()
 
 def _font(size, bold=False):
     path = FONT_BOLD if bold else FONT_PATH
-    if os.path.exists(path) and os.path.getsize(path) > 100000:
+    # Проверяем размер > 10 КБ
+    if os.path.exists(path) and os.path.getsize(path) > 10000:
         return ImageFont.truetype(path, size)
     
     try:
