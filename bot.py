@@ -2690,11 +2690,12 @@ def handle_chat_invite(peer_id, member_id):
             try: send(peer_id, f"🎭 {mention(member_id)} — *{role}*")
             except: pass
                 # ============ ДИАГНОСТИКА ============
-    def _startup_diagnostics():
+def _startup_diagnostics():
     # Скачиваем шрифты в папку /app/data
+    DATA_DIR = os.getenv('DATA_DIR', '/app/data')
     fonts = {
-    os.path.join(DATA_DIR, "font_regular.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
-    os.path.join(DATA_DIR, "font_bold.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlfBBc9.ttf"
+        os.path.join(DATA_DIR, "font_regular.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
+        os.path.join(DATA_DIR, "font_bold.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlfBBc9.ttf"
     }
     
     for name, url in fonts.items():
@@ -2729,30 +2730,7 @@ def handle_chat_invite(peer_id, member_id):
         log("   ✅ stats_card.py загружен")
     except Exception as e:
         log(f"   ❌ stats_card.py НЕ загружен: {e}")
-    try:
-        # Просто проверяем, что модуль доступен глобально
-        _ = requests.__version__
-        log("   ✅ requests установлен")
-    except Exception as e:
-        log(f"   ❌ requests НЕ установлен: {e}")
-        
-    try:
-        import stats_card
-        log("   ✅ stats_card.py загружен")
-    except Exception as e:
-        log(f"   ❌ stats_card.py НЕ загружен: {e}")
-        
-    try:
-        from stats_card import render_card
-        test = render_card("https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg",
-                           {"name": "Тест", "title":"Test"}, out_path="test_stats.png")
-        if os.path.exists(test):
-            log(f"   ✅ Тестовая карточка: {test} ({os.path.getsize(test)} байт)")
-            try: os.remove(test)
-            except: pass
-    except Exception as e:
-        log(f"   ❌ Тест render_card: {e}")
-        
+
 # ============ ЗАПУСК ============
 def main():
     global vk, longpoll
