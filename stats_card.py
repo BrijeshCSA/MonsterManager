@@ -3,8 +3,15 @@ import os, io, requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 W, H = 1080, 1080
-FONT_PATH  = "font_regular.ttf"
-FONT_BOLD  = "font_bold.ttf"
+
+# Определяем папку для данных (ту же, где лежит БД)
+DATA_DIR = os.getenv('DATA_DIR', '/app/data')
+if not os.path.exists(DATA_DIR):
+    try: os.makedirs(DATA_DIR, exist_ok=True)
+    except: pass
+
+FONT_PATH  = os.path.join(DATA_DIR, "font_regular.ttf")
+FONT_BOLD  = os.path.join(DATA_DIR, "font_bold.ttf")
 
 PURPLE = (200, 150, 255)
 SEP    = (168, 132, 230)
@@ -15,12 +22,38 @@ GREEN  = (140, 230, 160)
 
 SEP_LINE = "━━━━━━━━━━━━━━━━━━━━"
 
+# --- АВТОСКАЧИВАНИЕ ШРИФТОВ ---
+def ensure_fonts():
+    fonts = {
+        FONT_PATH: "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Regular.ttf",
+        FONT_BOLD: "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Bold.ttf"
+    }
+    for name, url in fonts.items():
+        # Если файла нет или он весит меньше 100 КБ (битый)
+        if not os.path.exists(name) or os.path.getsize(name) < 100000:
+            try:
+                print(f"⏳ Скачивание {name}...", flush=True)
+                resp = requests.get(url, timeout=20)
+                if resp.status_code == 200:
+                    with open(name, "wb") as f:
+                        f.write(resp.content)
+                    print(f"✅ Скачан {name} ({os.path.getsize(name)} байт)", flush=True)
+            except Exception as e:
+                print(f"❌ Ошибка скачивания {name}: {e}", flush=True)
+
+ensure_fonts()
+
 def _font(size, bold=False):
     path = FONT_BOLD if bold else FONT_PATH
-    if not os.path.exists(path):
-        try: return ImageFont.truetype("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf", size)
-        except: return ImageFont.load_default()
-    return ImageFont.truetype(path, size)
+    if os.path.exists(path) and os.path.getsize(path) > 100000:
+        return ImageFont.truetype(path, size)
+    
+    try:
+        fallback = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+        return ImageFont.truetype(fallback, size)
+    except: pass
+        
+    return ImageFont.load_default()
 
 def _xp_bar(cur, mx, cells=12):
     filled = round(cells * cur / mx) if mx else 0
@@ -56,12 +89,12 @@ def render_card(bg_source, u, avatar_url="", out_path="stats.png"):
             card.paste(av_img, (av_x, av_y), mask)
             draw.ellipse((av_x, av_y, av_x+av_size, av_y+av_size), outline=PURPLE, width=5)
         except Exception as e:
-            print(f"Ошибка аватарки: {e}")
-            draw.ellipse((av_x, av_y, av_x+av_size, av_y+av_size), fill=(50,50,50), outline=PURPLE, width=5)
+            pass
     else:
         draw.ellipse((av_x, av_y, av_x+av_size, av_y+av_size), fill=(50,50,50), outline=PURPLE, width=5)
 
     y_offset = av_y + av_size + 30
+    
     def draw_center(text, size, bold, color, y):
         f = _font(size, bold)
         w = draw.textbbox((0, 0), text, font=f)[2]
