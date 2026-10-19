@@ -11,7 +11,7 @@ def log(msg):
     print(msg, flush=True); sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
-FALLBACK_TOKEN = "vk1.a.SVQdRwpzCey4t3rSA8ygRG7KM58ZndwlFqEoWIVnu1AWzrzVOGuR-IpRKgmcuBfV5ZGwp9_5oMxBAx_On4346ambCyJh42ZCFKJCjCx3i7L3i6eEfdyjQsicFj8WIgxKE2HeY136KmaRHbJCeSRnG_XnrWrJx-9mfC0gt5ErVXXn0yOPC1HuZzuhAufNZ0ulyw70-z9n-23RWKRmF8ZZCg"  # Вставь сюда токен ИЛИ задай env VK_TOKEN на Bothost
+FALLBACK_TOKEN = ""  # Вставь сюда токен ИЛИ задай env VK_TOKEN на Bothost
 TOKEN = os.getenv("VK_TOKEN") or FALLBACK_TOKEN
 GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
 MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
@@ -48,8 +48,18 @@ MAT_ROOTS = (
     "долбоеб","долбоёб","залуп","шлюх","шалав","fuck","shit","bitch","cunt","dick","pussy","asshole",
 )
 
-# ============ БАЗА ДАННЫХ ============
-conn = sqlite3.connect('bot.db', check_same_thread=False)
+# ============ БАЗА ДАННЫХ (СОХРАНЕНИЕ В /app/data) ============
+DATA_DIR = os.getenv('DATA_DIR', '/app/data')
+if not os.path.exists(DATA_DIR):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        DATA_DIR = "." # fallback, если нет прав на создание
+
+DB_PATH = os.path.join(DATA_DIR, 'bot.db')
+log(f"📁 База данных: {DB_PATH}")
+
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
 def init_db():
@@ -576,12 +586,23 @@ if not _init_vk():
     log("⚠️ VK не инициализирован на старте — попробуем в main()")
 
 def send(peer_id, text, keyboard=None, attachment=None):
-    if peer_id >= 2000000000: keyboard = None
     try:
-        kw = {"peer_id": peer_id, "message": text, "random_id": get_random_id(), "keyboard": keyboard}
-        if attachment: kw["attachment"] = attachment
+        kw = {"peer_id": peer_id, "message": text, "random_id": get_random_id()}
+        # Клавиатура ТОЛЬКО в ЛС — в беседах VK её не принимает
+        if peer_id < 2000000000 and keyboard:
+            kw["keyboard"] = keyboard
+        if attachment:
+            kw["attachment"] = attachment
         vk.messages.send(**kw)
-    except Exception as e: log(f"❌ Send: {e}")
+    except Exception as e:
+        log(f"❌ Send peer={peer_id}: {e}")
+        # Если упало из-за клавиатуры — пробуем без неё
+        if "keyboard" in kw:
+            try:
+                del kw["keyboard"]
+                vk.messages.send(**kw)
+            except Exception as e2:
+                log(f"❌ Send без kb: {e2}")
 
 def send_uid(user_id, text, keyboard=None):
     try: vk.messages.send(user_id=user_id, message=text, random_id=get_random_id(), keyboard=keyboard)
@@ -613,15 +634,43 @@ def get_chat_link(peer_id):
 
 # ============ ОТПРАВКА КАРТИНКИ /СТАТА ============
 def vk_upload_photo(peer_id, file_path):
+    """Загружает фото. Работает и для ЛС, и для бесед."""
     try:
-        server = vk.photos.getMessagesUploadServer(peer_id=peer_id)
+        server = None
+        try:
+            server = vk.photos.getMessagesUploadServer(peer_id=peer_id)
+            log(f"📤 upload server (peer_id={peer_id}) OK")
+        except Exception as e1:
+            log(f"⚠️ upload с peer_id упал: {e1}, пробую без")
+            try:
+                server = vk.photos.getMessagesUploadServer()
+                log("📤 upload server (без peer_id) OK")
+            except Exception as e2:
+                log(f"❌ upload без peer_id: {e2}")
+                return None
+
         with open(file_path, "rb") as f:
-            resp = requests.post(server["upload_url"], files={"photo": ("stats.png", f)}).json()
-        saved = vk.photos.saveMessagesPhoto(photo=resp["photo"], server=resp["server"], hash=resp["hash"])
+            r = requests.post(server["upload_url"], files={"photo": ("stats.png", f)}, timeout=20)
+        resp = r.json()
+        log(f"📤 upload resp: {str(resp)[:200]}")
+
+        if "photo" not in resp:
+            log(f"❌ нет photo в ответе: {resp}")
+            return None
+
+        saved = vk.photos.saveMessagesPhoto(
+            photo=resp["photo"], server=resp["server"], hash=resp["hash"]
+        )
+        if not saved:
+            log("❌ saveMessagesPhoto вернул пусто")
+            return None
         p = saved[0]
-        return f"photo{p['owner_id']}_{p['id']}"
+        att = f"photo{p['owner_id']}_{p['id']}"
+        log(f"✅ Фото загружено: {att}")
+        return att
     except Exception as e:
         log(f"❌ vk_upload_photo: {e}")
+        traceback.print_exc(file=sys.stdout)
         return None
 
 _stats_cache = {}
@@ -655,26 +704,50 @@ def send_stats_card(peer_id, uid, chat_id=None):
         try:
             vk.messages.send(peer_id=peer_id, message="", random_id=get_random_id(), attachment=cached[0])
             return True
-        except: pass
+        except Exception as e:
+            log(f"⚠️ cached send упал: {e}")
+
     try:
         from stats_card import render_card
     except Exception as e:
-        log(f"⚠️ stats_card не загружен: {e}")
+        log(f"❌ stats_card НЕ загружен: {type(e).__name__}: {e}")
         return False
+
+    try:
+        from PIL import Image as _T1
+        import requests as _T2
+    except Exception as e:
+        log(f"❌ Pillow/requests не установлены: {e}")
+        return False
+
     try:
         u = build_stats_user_dict(uid, chat_id)
         bg_url = "https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg"
         path = render_card(bg_url, u, out_path=f"stats_{uid}.png")
-        att = vk_upload_photo(peer_id, path)
-        if not att: return False
-        _stats_cache[uid] = (att, now)
+        log(f"✅ Картинка сгенерирована: {path}")
+    except Exception as e:
+        log(f"❌ render_card: {type(e).__name__}: {e}")
+        traceback.print_exc(file=sys.stdout)
+        return False
+
+    att = vk_upload_photo(peer_id, path)
+    if not att:
+        log(f"❌ Не удалось загрузить фото для peer={peer_id}")
+        try: os.remove(path)
+        except: pass
+        return False
+
+    try:
         vk.messages.send(peer_id=peer_id, message="", random_id=get_random_id(), attachment=att)
+        _stats_cache[uid] = (att, now)
+        log(f"✅ /стата отправлена (peer={peer_id}, att={att})")
         try: os.remove(path)
         except: pass
         return True
     except Exception as e:
-        log(f"❌ send_stats_card: {e}")
-        traceback.print_exc(file=sys.stdout)
+        log(f"❌ Финальный send упал: {e}")
+        try: os.remove(path)
+        except: pass
         return False
 
 # ============ КЛАВИАТУРЫ ============
@@ -1761,7 +1834,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if send_stats_card(peer_id, t, chat_id):
             return
             
-        # Если картинка не удалась (нет библиотек) — шлём текст
+        # Если картинка не удалась — шлём текстом
         lvl = ulevel(t); exp = uexp(t); need = (lvl+1)*100
         prog = get_progress_bar(exp, need, 8)
         pct = int((exp/need)*100) if need > 0 else 0
@@ -2578,6 +2651,35 @@ def handle_chat_invite(peer_id, member_id):
             try: send(peer_id, f"🎭 {mention(member_id)} — *{role}*")
             except: pass
 
+# ============ ДИАГНОСТИКА ============
+def _startup_diagnostics():
+    log("🔍 ПРОВЕРКА ОКРУЖЕНИЯ:")
+    try:
+        from PIL import Image
+        log("   ✅ Pillow установлен")
+    except Exception as e:
+        log(f"   ❌ Pillow НЕ установлен: {e}")
+    try:
+        import requests
+        log("   ✅ requests установлен")
+    except Exception as e:
+        log(f"   ❌ requests НЕ установлен: {e}")
+    try:
+        import stats_card
+        log("   ✅ stats_card.py загружен")
+    except Exception as e:
+        log(f"   ❌ stats_card.py НЕ загружен: {e}")
+    try:
+        from stats_card import render_card
+        test = render_card("https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg",
+                           {"title":"Test"}, out_path="test_stats.png")
+        if os.path.exists(test):
+            log(f"   ✅ Тестовая карточка: {test} ({os.path.getsize(test)} байт)")
+            try: os.remove(test)
+            except: pass
+    except Exception as e:
+        log(f"   ❌ Тест render_card: {e}")
+
 # ============ ЗАПУСК ============
 def main():
     global vk, longpoll
@@ -2602,6 +2704,8 @@ def main():
         log(f"🎨 Стиль: {style_name()}")
     except Exception as e: 
         log(f"⚠️ Ошибка при инициализации данных: {e}")
+
+    _startup_diagnostics()
 
     log("🎧 Слушаю события...")
     threading.Thread(target=pr_resend_worker, daemon=True).start()
