@@ -414,19 +414,17 @@ def is_owner(uid):
 def is_admin(uid): return get_priority(uid) >= 10
 def is_staff(uid): return get_priority(uid) >= 4
 
-# ============ ПРОВЕРКА «ЗВЕЗДЫ» В ЧАТЕ ============
+# ============ ПРОВЕРКА «ЗВЕЗДЫ» И ПРАВ ============
 _admin_cache = {}
 ADMIN_CACHE_TTL = 300
 
 def is_chat_admin(chat_id, uid):
-    """Проверяет, есть ли у юзера права администратора в этом чате (звезда)"""
+    """Проверяет, есть ли у ЮЗЕРА права администратора в этом чате"""
     if uid in OWNERS: return True
-    
     now = time.time()
-    cache_key = (chat_id, uid)
+    cache_key = ("user", chat_id, uid)
     if cache_key in _admin_cache and now - _admin_cache[cache_key][1] < ADMIN_CACHE_TTL:
         return _admin_cache[cache_key][0]
-        
     try:
         res = vk.messages.getConversationMembers(peer_id=2000000000+chat_id)
         for item in res.get('items', []):
@@ -435,10 +433,33 @@ def is_chat_admin(chat_id, uid):
                 _admin_cache[cache_key] = (is_adm, now)
                 return is_adm
     except Exception as e:
-        log(f"⚠️ Ошибка проверки звезды (бот не админ?): {e}")
+        log(f"⚠️ Ошибка проверки звезды юзера (бот не админ?): {e}")
         return False
-        
     return False
+
+def bot_is_chat_admin(chat_id):
+    """Проверяет, есть ли у БОТА права администратора в этом чате"""
+    if not chat_id: return True  # В ЛС всегда можно
+    now = time.time()
+    cache_key = ("bot", chat_id)
+    if cache_key in _admin_cache and now - _admin_cache[cache_key][1] < ADMIN_CACHE_TTL:
+        return _admin_cache[cache_key][0]
+    try:
+        res = vk.messages.getConversationMembers(peer_id=2000000000+chat_id)
+        for item in res.get('items', []):
+            if item.get('member_id', 0) < 0:  # Бот имеет отрицательный ID
+                result = item.get('is_admin', False) or item.get('is_owner', False)
+                _admin_cache[cache_key] = (result, now)
+                return result
+    except Exception as e:
+        log(f"⚠️ Ошибка проверки прав бота в чате {chat_id}: {e}")
+        return False
+    return False
+
+def can_punish(uid, chat_id):
+    """Может ли юзер наказать в этом чате (стафф бота + бот админ в чате)"""
+    if not is_admin(uid): return False
+    return bot_is_chat_admin(chat_id)
 
 def is_muted(uid):
     m = umute(uid)
@@ -733,7 +754,6 @@ def send_stats_card(peer_id, uid, chat_id=None):
     cached = _stats_cache.get(uid)
     if cached and now - cached[1] < STATS_CACHE_TTL:
         try:
-            # ДОБАВЛЕН ТЕКСТ "📸 Профиль"
             vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=cached[0])
             return True
         except Exception as e:
@@ -773,7 +793,7 @@ def send_stats_card(peer_id, uid, chat_id=None):
         return False
 
     try:
-        # ДОБАВЛЕН ТЕКСТ "📸 Профиль", чтобы VK не блокировал пустое сообщение
+        # Обязательно передаем текст, иначе VK может отклонить фото в беседе
         vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=att)
         _stats_cache[uid] = (att, now)
         log(f"✅ /стата отправлена (peer={peer_id}, att={att})")
@@ -1630,12 +1650,6 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     args = text.split(); cmd = args[0].lower() if args else ""
     chat_id = peer_to_chat(peer_id)
 
-    # ============ ПРОВЕРКА ЗВЕЗДЫ ДЛЯ ЧАТОВ ============
-    if chat_id:
-        # Если у юзера нет звезды в чате И он не стафф бота -> игнорируем команды
-        if not is_chat_admin(chat_id, uid) and not is_staff(uid):
-            return
-
     if cmd == "/stop":
         if not is_owner(uid): return
         cur.execute("INSERT OR REPLACE INTO bot_disabled(peer_id,since) VALUES(?,?)", (peer_id, int(time.time())))
@@ -1758,7 +1772,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     # ============ МОДЕРАЦИЯ ============
     if cmd == "/warn":
-        if not is_admin(uid): return
+        if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t or is_owner(t) or is_admin(t): return
         get_user(t); cur.execute("UPDATE users SET warns=warns+1 WHERE user_id=?", (t,)); conn.commit()
@@ -1776,8 +1790,14 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             send_uid(t, f"⚠️ Тебе выдан варн ({w}/3). Причина: {reason}")
         return
 
+    if cmd == "/unwarn":
+        if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
+        t = extract_uid(args[1] if len(args)>1 else None, event_msg)
+        if t: cur.execute("UPDATE users SET warns=MAX(0,warns-1) WHERE user_id=?", (t,)); conn.commit()
+        return
+
     if cmd == "/mute":
-        if not is_admin(uid): return
+        if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t: return send(peer_id, "📝 /mute <юзер> <мин> [причина]")
         try: m = int(args[2]) if len(args)>2 else 60
@@ -1791,13 +1811,13 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send_uid(t, f"🔇 Ты заглушен на {time_left_fmt(m*60)}. Причина: {reason}"); return
 
     if cmd == "/unmute":
-        if not is_admin(uid): return
+        if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if t: cur.execute("UPDATE users SET mute_until=0, mute_notify=0 WHERE user_id=?", (t,)); conn.commit()
         send(peer_id, f"✅ {mention(t)} размучен"); return
 
     if cmd == "/kick":
-        if not is_admin(uid) or not chat_id: return
+        if not can_punish(uid, chat_id) or not chat_id: return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t or is_owner(t) or is_admin(t): return
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
@@ -1805,7 +1825,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, punish_card("kick", t, reason, uid)); return
 
     if cmd == "/ban":
-        if not is_admin(uid): return
+        if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t or is_owner(t) or is_admin(t): return
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
@@ -1816,7 +1836,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send_uid(t, f"🚫 Ты забанен. Причина: {reason}"); return
 
     if cmd in ("/unban", "/ungban"):
-        if not is_admin(uid): return
+        if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if t:
             cur.execute("DELETE FROM bans WHERE user_id=?", (t,)); conn.commit()
@@ -1825,6 +1845,8 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     if cmd == "/gban":
         if not is_owner(uid): return
+        if not bot_is_chat_admin(chat_id) and chat_id:
+            return send(peer_id, "❌ Бот не админ в этом чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t or t in OWNERS: return
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
@@ -2203,7 +2225,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         send(peer_id, "✅ Этот чат помечен как 📢 PIAR"); return
 
     if cmd == "/тишина":
-        if not is_admin(uid) or not chat_id: return
+        if not can_punish(uid, chat_id) or not chat_id: return send(peer_id, "❌ Бот не админ в чате")
         if len(args) < 2: return send(peer_id, "📝 /тишина <0-101|выкл>")
         if args[1].lower() in ("выкл","off","0"):
             cur.execute("DELETE FROM chat_silence WHERE chat_id=?", (chat_id,)); conn.commit()
