@@ -419,7 +419,7 @@ _admin_cache = {}
 ADMIN_CACHE_TTL = 300  # 5 минут
 
 def is_chat_admin(chat_id, uid):
-    """Проверяет, есть ли у юзера права администратора в этом чате"""
+    """Проверяет, есть ли у юзера права администратора в этом чате (звезда)"""
     if uid in OWNERS: return True
     
     now = time.time()
@@ -612,7 +612,6 @@ if not _init_vk():
 def send(peer_id, text, keyboard=None, attachment=None):
     try:
         kw = {"peer_id": peer_id, "message": text, "random_id": get_random_id()}
-        # Клавиатура ТОЛЬКО в ЛС — в беседах VK её не принимает
         if peer_id < 2000000000 and keyboard:
             kw["keyboard"] = keyboard
         if attachment:
@@ -620,7 +619,6 @@ def send(peer_id, text, keyboard=None, attachment=None):
         vk.messages.send(**kw)
     except Exception as e:
         log(f"❌ Send peer={peer_id}: {e}")
-        # Если упало из-за клавиатуры — пробуем без неё
         if "keyboard" in kw:
             try:
                 del kw["keyboard"]
@@ -658,7 +656,6 @@ def get_chat_link(peer_id):
 
 # ============ ОТПРАВКА КАРТИНКИ /СТАТА ============
 def vk_upload_photo(peer_id, file_path):
-    """Загружает фото. Работает и для ЛС, и для бесед."""
     try:
         server = None
         try:
@@ -713,7 +710,6 @@ def build_stats_user_dict(uid, chat_id=None):
     status = get_title(lvl)
     status_emoji = get_priority_emoji(get_priority(uid))
 
-    # Получаем аватарку
     avatar_url = ""
     try:
         info = vk.users.get(user_ids=uid, fields="photo_200")[0]
@@ -759,7 +755,6 @@ def send_stats_card(peer_id, uid, chat_id=None):
         u = build_stats_user_dict(uid, chat_id)
         bg_url = "https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg"
         
-        # Передаем аватарку
         avatar_url = u.get("avatar_url", "")
         path = render_card(bg_url, u, avatar_url=avatar_url, out_path=f"stats_{uid}.png")
         
@@ -2700,26 +2695,36 @@ def handle_chat_invite(peer_id, member_id):
 def _startup_diagnostics():
     # Скачиваем шрифты с надежного CDN
     fonts = {
-        "font_regular.ttf": "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Regular.ttf",
-        "font_bold.ttf": "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Bold.ttf"
+        "font_regular.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Regular.ttf",
+        "font_bold.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Bold.ttf"
     }
     for name, url in fonts.items():
-        # Проверяем, что файла нет или он битый (меньше 10 КБ)
-        if not os.path.exists(name) or os.path.getsize(name) < 10000:
+        # Проверяем, что файла нет или он битый (меньше 100 КБ)
+        if not os.path.exists(name) or os.path.getsize(name) < 100000:
             try:
-                resp = requests.get(url, timeout=15)
-                with open(name, "wb") as f:
-                    f.write(resp.content)
-                log(f"✅ Скачан шрифт: {name} ({os.path.getsize(name)} байт)")
+                log(f"⏳ Скачивание {name}...")
+                resp = requests.get(url, timeout=20)
+                if resp.status_code == 200:
+                    with open(name, "wb") as f:
+                        f.write(resp.content)
+                    log(f"✅ Скачан шрифт: {name} ({os.path.getsize(name)} байт)")
+                else:
+                    log(f"❌ Ошибка скачивания {name}: статус {resp.status_code}")
             except Exception as e:
                 log(f"❌ Ошибка скачивания {name}: {e}")
 
     log("🔍 ПРОВЕРКА ОКРУЖЕНИЯ:")
     try:
-        from PIL import Image
+        from PIL import Image, ImageFont
         log("   ✅ Pillow установлен")
+        if os.path.exists("font_regular.ttf"):
+            test_font = ImageFont.truetype("font_regular.ttf", 20)
+            log("   ✅ Шрифт успешно загружен в Pillow")
+        else:
+            log("   ❌ Шрифт не найден локально!")
     except Exception as e:
-        log(f"   ❌ Pillow НЕ установлен: {e}")
+        log(f"   ❌ Ошибка Pillow/шрифта: {e}")
+        
     try:
         import requests
         log("   ✅ requests установлен")
