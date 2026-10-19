@@ -6,12 +6,13 @@ import sqlite3, random, time, json, os, sys, traceback, threading
 from datetime import datetime
 from collections import deque
 import requests
+import urllib.request
 
 def log(msg):
     print(msg, flush=True); sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
-FALLBACK_TOKEN = ""  # Вставь сюда токен ИЛИ задай env VK_TOKEN на Bothost
+FALLBACK_TOKEN = ""  # Вставь токен ИЛИ задай env VK_TOKEN
 TOKEN = os.getenv("VK_TOKEN") or FALLBACK_TOKEN
 GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
 MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
@@ -48,13 +49,11 @@ MAT_ROOTS = (
     "долбоеб","долбоёб","залуп","шлюх","шалав","fuck","shit","bitch","cunt","dick","pussy","asshole",
 )
 
-# ============ БАЗА ДАННЫХ (СОХРАНЕНИЕ В /app/data) ============
+# ============ БАЗА ДАННЫХ (В /app/data) ============
 DATA_DIR = os.getenv('DATA_DIR', '/app/data')
 if not os.path.exists(DATA_DIR):
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except Exception:
-        DATA_DIR = "." # fallback, если нет прав на создание
+    try: os.makedirs(DATA_DIR, exist_ok=True)
+    except: DATA_DIR = "."
 
 DB_PATH = os.path.join(DATA_DIR, 'bot.db')
 log(f"📁 База данных: {DB_PATH}")
@@ -688,12 +687,23 @@ def build_stats_user_dict(uid, chat_id=None):
     chat_role = ur[0] if ur else "Участник"
     status = get_title(lvl)
     status_emoji = get_priority_emoji(get_priority(uid))
+
+    # Получаем аватарку
+    avatar_url = ""
+    try:
+        info = vk.users.get(user_ids=uid, fields="photo_200")[0]
+        avatar_url = info.get("photo_200", "")
+    except: pass
+
     return {
+        "name": name_of(uid),
+        "avatar_url": avatar_url,
         "title": pos, "priv": "Игрок", "vip": is_vip(uid),
         "role": chat_role, "priority": get_priority(uid), "msgs": umsg_count(uid),
         "lvl": lvl, "lvl_max": 999, "xp": exp, "xp_max": need, "xp_pct": pct,
         "warns": uwarns(uid), "marriage": partner, "rep": urep(uid),
         "nick": ufield(uid, "nick") or "не установлен", "gift": udrone_name(uid) or "—",
+        "drone_mult": udrone_mult(uid),
         "status": status, "status_emoji": status_emoji,
     }
 
@@ -723,7 +733,11 @@ def send_stats_card(peer_id, uid, chat_id=None):
     try:
         u = build_stats_user_dict(uid, chat_id)
         bg_url = "https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg"
-        path = render_card(bg_url, u, out_path=f"stats_{uid}.png")
+        
+        # Передаем аватарку
+        avatar_url = u.get("avatar_url", "")
+        path = render_card(bg_url, u, avatar_url=avatar_url, out_path=f"stats_{uid}.png")
+        
         log(f"✅ Картинка сгенерирована: {path}")
     except Exception as e:
         log(f"❌ render_card: {type(e).__name__}: {e}")
@@ -2653,6 +2667,19 @@ def handle_chat_invite(peer_id, member_id):
 
 # ============ ДИАГНОСТИКА ============
 def _startup_diagnostics():
+    # Скачиваем шрифты, если их нет
+    fonts = {
+        "font_regular.ttf": "https://github.com/google/fonts/raw/main/ofl/roboto/Roboto-Regular.ttf",
+        "font_bold.ttf": "https://github.com/google/fonts/raw/main/ofl/roboto/Roboto-Bold.ttf"
+    }
+    for name, url in fonts.items():
+        if not os.path.exists(name):
+            try:
+                urllib.request.urlretrieve(url, name)
+                log(f"✅ Скачан шрифт: {name}")
+            except Exception as e:
+                log(f"❌ Ошибка скачивания {name}: {e}")
+
     log("🔍 ПРОВЕРКА ОКРУЖЕНИЯ:")
     try:
         from PIL import Image
