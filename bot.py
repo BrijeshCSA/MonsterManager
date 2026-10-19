@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.utils import get_random_id
@@ -415,7 +416,7 @@ def is_staff(uid): return get_priority(uid) >= 4
 
 # ============ ПРОВЕРКА «ЗВЕЗДЫ» В ЧАТЕ ============
 _admin_cache = {}
-ADMIN_CACHE_TTL = 300  # 5 минут
+ADMIN_CACHE_TTL = 300
 
 def is_chat_admin(chat_id, uid):
     """Проверяет, есть ли у юзера права администратора в этом чате (звезда)"""
@@ -434,7 +435,7 @@ def is_chat_admin(chat_id, uid):
                 _admin_cache[cache_key] = (is_adm, now)
                 return is_adm
     except Exception as e:
-        log(f"❌ Ошибка проверки звезды: {e}")
+        log(f"⚠️ Ошибка проверки звезды (бот не админ?): {e}")
         return False
         
     return False
@@ -732,7 +733,8 @@ def send_stats_card(peer_id, uid, chat_id=None):
     cached = _stats_cache.get(uid)
     if cached and now - cached[1] < STATS_CACHE_TTL:
         try:
-            vk.messages.send(peer_id=peer_id, message="", random_id=get_random_id(), attachment=cached[0])
+            # ДОБАВЛЕН ТЕКСТ "📸 Профиль"
+            vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=cached[0])
             return True
         except Exception as e:
             log(f"⚠️ cached send упал: {e}")
@@ -771,7 +773,8 @@ def send_stats_card(peer_id, uid, chat_id=None):
         return False
 
     try:
-        vk.messages.send(peer_id=peer_id, message="", random_id=get_random_id(), attachment=att)
+        # ДОБАВЛЕН ТЕКСТ "📸 Профиль", чтобы VK не блокировал пустое сообщение
+        vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=att)
         _stats_cache[uid] = (att, now)
         log(f"✅ /стата отправлена (peer={peer_id}, att={att})")
         try: os.remove(path)
@@ -2689,17 +2692,17 @@ def handle_chat_invite(peer_id, member_id):
         if role:
             try: send(peer_id, f"🎭 {mention(member_id)} — *{role}*")
             except: pass
-                # ============ ДИАГНОСТИКА ============
+
+# ============ ДИАГНОСТИКА ============
 def _startup_diagnostics():
     DATA_DIR = os.getenv('DATA_DIR', '/app/data')
     fonts = {
-        os.path.join(DATA_DIR, "font_regular.ttf"): "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
-        os.path.join(DATA_DIR, "font_bold.ttf"): "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
+        os.path.join(DATA_DIR, "font_regular.ttf"): "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Regular.ttf",
+        os.path.join(DATA_DIR, "font_bold.ttf"): "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Bold.ttf"
     }
     
     for name, url in fonts.items():
-        # Если файла нет или он весит меньше 10 КБ (битый)
-        if not os.path.exists(name) or os.path.getsize(name) < 10000:
+        if not os.path.exists(name) or os.path.getsize(name) < 100000:
             try:
                 log(f"⏳ Скачивание {name}...")
                 resp = requests.get(url, timeout=20)
@@ -2718,8 +2721,7 @@ def _startup_diagnostics():
         log("   ✅ Pillow установлен")
         test_font_path = os.path.join(DATA_DIR, "font_regular.ttf")
         
-        # Проверяем размер > 10 КБ
-        if os.path.exists(test_font_path) and os.path.getsize(test_font_path) > 10000:
+        if os.path.exists(test_font_path) and os.path.getsize(test_font_path) > 100000:
             ImageFont.truetype(test_font_path, 20)
             log("   ✅ Шрифт успешно загружен в Pillow")
         else:
