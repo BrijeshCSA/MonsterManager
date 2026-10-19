@@ -6,7 +6,6 @@ import sqlite3, random, time, json, os, sys, traceback, threading
 from datetime import datetime
 from collections import deque
 import requests
-import urllib.request
 
 def log(msg):
     print(msg, flush=True); sys.stdout.flush()
@@ -49,7 +48,7 @@ MAT_ROOTS = (
     "долбоеб","долбоёб","залуп","шлюх","шалав","fuck","shit","bitch","cunt","dick","pussy","asshole",
 )
 
-# ============ БАЗА ДАННЫХ (В /app/data) ============
+# ============ БАЗА ДАННЫХ ============
 DATA_DIR = os.getenv('DATA_DIR', '/app/data')
 if not os.path.exists(DATA_DIR):
     try: os.makedirs(DATA_DIR, exist_ok=True)
@@ -414,6 +413,32 @@ def is_owner(uid):
     return get_priority(uid) >= 80
 def is_admin(uid): return get_priority(uid) >= 10
 def is_staff(uid): return get_priority(uid) >= 4
+
+# ============ ПРОВЕРКА «ЗВЕЗДЫ» В ЧАТЕ ============
+_admin_cache = {}
+ADMIN_CACHE_TTL = 300  # 5 минут
+
+def is_chat_admin(chat_id, uid):
+    """Проверяет, есть ли у юзера права администратора в этом чате"""
+    if uid in OWNERS: return True
+    
+    now = time.time()
+    cache_key = (chat_id, uid)
+    if cache_key in _admin_cache and now - _admin_cache[cache_key][1] < ADMIN_CACHE_TTL:
+        return _admin_cache[cache_key][0]
+        
+    try:
+        res = vk.messages.getConversationMembers(peer_id=2000000000+chat_id)
+        for item in res.get('items', []):
+            if item.get('member_id') == uid:
+                is_adm = item.get('is_admin', False) or item.get('is_owner', False)
+                _admin_cache[cache_key] = (is_adm, now)
+                return is_adm
+    except Exception as e:
+        log(f"❌ Ошибка проверки звезды: {e}")
+        return False
+        
+    return False
 
 def is_muted(uid):
     m = umute(uid)
@@ -1608,6 +1633,12 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     args = text.split(); cmd = args[0].lower() if args else ""
     chat_id = peer_to_chat(peer_id)
 
+    # ============ ПРОВЕРКА ЗВЕЗДЫ ДЛЯ ЧАТОВ ============
+    if chat_id:
+        # Если у юзера нет звезды в чате И он не стафф бота -> игнорируем команды
+        if not is_chat_admin(chat_id, uid) and not is_staff(uid):
+            return
+
     if cmd == "/stop":
         if not is_owner(uid): return
         cur.execute("INSERT OR REPLACE INTO bot_disabled(peer_id,since) VALUES(?,?)", (peer_id, int(time.time())))
@@ -2667,16 +2698,19 @@ def handle_chat_invite(peer_id, member_id):
 
 # ============ ДИАГНОСТИКА ============
 def _startup_diagnostics():
-    # Скачиваем шрифты, если их нет
+    # Скачиваем шрифты с надежного CDN
     fonts = {
-        "font_regular.ttf": "https://github.com/google/fonts/raw/main/ofl/roboto/Roboto-Regular.ttf",
-        "font_bold.ttf": "https://github.com/google/fonts/raw/main/ofl/roboto/Roboto-Bold.ttf"
+        "font_regular.ttf": "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Regular.ttf",
+        "font_bold.ttf": "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Bold.ttf"
     }
     for name, url in fonts.items():
-        if not os.path.exists(name):
+        # Проверяем, что файла нет или он битый (меньше 10 КБ)
+        if not os.path.exists(name) or os.path.getsize(name) < 10000:
             try:
-                urllib.request.urlretrieve(url, name)
-                log(f"✅ Скачан шрифт: {name}")
+                resp = requests.get(url, timeout=15)
+                with open(name, "wb") as f:
+                    f.write(resp.content)
+                log(f"✅ Скачан шрифт: {name} ({os.path.getsize(name)} байт)")
             except Exception as e:
                 log(f"❌ Ошибка скачивания {name}: {e}")
 
@@ -2699,7 +2733,7 @@ def _startup_diagnostics():
     try:
         from stats_card import render_card
         test = render_card("https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg",
-                           {"title":"Test"}, out_path="test_stats.png")
+                           {"name": "Тест", "title":"Test"}, out_path="test_stats.png")
         if os.path.exists(test):
             log(f"   ✅ Тестовая карточка: {test} ({os.path.getsize(test)} байт)")
             try: os.remove(test)
