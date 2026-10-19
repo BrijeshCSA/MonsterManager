@@ -2693,11 +2693,12 @@ def handle_chat_invite(peer_id, member_id):
 def _startup_diagnostics():
     DATA_DIR = os.getenv('DATA_DIR', '/app/data')
     fonts = {
-        os.path.join(DATA_DIR, "font_regular.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
-        os.path.join(DATA_DIR, "font_bold.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlfBBc9.ttf"
+        os.path.join(DATA_DIR, "font_regular.ttf"): "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
+        os.path.join(DATA_DIR, "font_bold.ttf"): "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
     }
     
     for name, url in fonts.items():
+        # Если файла нет или он весит меньше 10 КБ (битый)
         if not os.path.exists(name) or os.path.getsize(name) < 10000:
             try:
                 log(f"⏳ Скачивание {name}...")
@@ -2717,7 +2718,7 @@ def _startup_diagnostics():
         log("   ✅ Pillow установлен")
         test_font_path = os.path.join(DATA_DIR, "font_regular.ttf")
         
-        # ТУТ БЫЛО 100000, ТЕПЕРЬ 10000
+        # Проверяем размер > 10 КБ
         if os.path.exists(test_font_path) and os.path.getsize(test_font_path) > 10000:
             ImageFont.truetype(test_font_path, 20)
             log("   ✅ Шрифт успешно загружен в Pillow")
