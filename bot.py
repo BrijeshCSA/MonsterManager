@@ -2691,7 +2691,6 @@ def handle_chat_invite(peer_id, member_id):
             except: pass
                 # ============ ДИАГНОСТИКА ============
 def _startup_diagnostics():
-    # Скачиваем шрифты в папку /app/data
     DATA_DIR = os.getenv('DATA_DIR', '/app/data')
     fonts = {
         os.path.join(DATA_DIR, "font_regular.ttf"): "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
@@ -2699,7 +2698,7 @@ def _startup_diagnostics():
     }
     
     for name, url in fonts.items():
-        if not os.path.exists(name) or os.path.getsize(name) < 100000:
+        if not os.path.exists(name) or os.path.getsize(name) < 10000:
             try:
                 log(f"⏳ Скачивание {name}...")
                 resp = requests.get(url, timeout=20)
@@ -2717,7 +2716,9 @@ def _startup_diagnostics():
         from PIL import Image, ImageFont
         log("   ✅ Pillow установлен")
         test_font_path = os.path.join(DATA_DIR, "font_regular.ttf")
-        if os.path.exists(test_font_path) and os.path.getsize(test_font_path) > 100000:
+        
+        # ТУТ БЫЛО 100000, ТЕПЕРЬ 10000
+        if os.path.exists(test_font_path) and os.path.getsize(test_font_path) > 10000:
             ImageFont.truetype(test_font_path, 20)
             log("   ✅ Шрифт успешно загружен в Pillow")
         else:
