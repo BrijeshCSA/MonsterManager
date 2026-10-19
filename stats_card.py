@@ -24,9 +24,9 @@ SEP_LINE = "━━━━━━━━━━━━━━━━━━━━"
 
 # --- АВТОСКАЧИВАНИЕ ШРИФТОВ ---
 def ensure_fonts():
-    fonts = {
-        FONT_PATH: "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Regular.ttf",
-        FONT_BOLD: "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto-Bold.ttf"
+    fonts = fonts = {
+    FONT_PATH: "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxP.ttf",
+    FONT_BOLD: "https://fonts.gstatic.com/s/roboto/v30/KFOlCnqEu92Fr1MmWUlfBBc9.ttf"
     }
     for name, url in fonts.items():
         # Если файла нет или он весит меньше 100 КБ (битый)
