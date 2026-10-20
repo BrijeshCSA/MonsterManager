@@ -6,12 +6,13 @@ import sqlite3, random, time, json, os, sys, traceback, threading
 from datetime import datetime
 from collections import deque
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 def log(msg):
     print(msg, flush=True); sys.stdout.flush()
 
 # ============ НАСТРОЙКИ ============
-FALLBACK_TOKEN = ""  # Вставь токен ИЛИ задай env VK_TOKEN
+FALLBACK_TOKEN = ""
 TOKEN = os.getenv("VK_TOKEN") or FALLBACK_TOKEN
 GROUP_ID = int(os.getenv("GROUP_ID", 242006213))
 MAIN_OWNER = int(os.getenv("MAIN_OWNER", 889701916))
@@ -57,19 +58,53 @@ if not os.path.exists(DATA_DIR):
 DB_PATH = os.path.join(DATA_DIR, 'bot.db')
 log(f"📁 База данных: {DB_PATH}")
 
-conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-cur = conn.cursor()
+# ============ THREAD-LOCAL SQLITE (устраняет race между потоками) ============
+_tls = threading.local()
 
-# ============ SQLITE ОПТИМИЗАЦИЯ ============
-try:
-    cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA synchronous=NORMAL")
-    cur.execute("PRAGMA cache_size=-64000")     # ~64 МБ кеша
-    cur.execute("PRAGMA temp_store=MEMORY")
-    cur.execute("PRAGMA busy_timeout=30000")
-    log("⚡ SQLite оптимизирован (WAL, 64MB cache)")
-except Exception as e:
-    log(f"⚠️ PRAGMA: {e}")
+def _new_conn():
+    c = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA cache_size=-16000")
+    c.execute("PRAGMA temp_store=MEMORY")
+    c.execute("PRAGMA busy_timeout=30000")
+    c.commit()
+    return c
+
+def _get_conn():
+    if not hasattr(_tls, 'conn'):
+        _tls.conn = _new_conn()
+    return _tls.conn
+
+def _get_cur():
+    if not hasattr(_tls, 'cur'):
+        _tls.cur = _get_conn().cursor()
+    return _tls.cur
+
+class _CurProxy:
+    def __getattr__(self, name):
+        return getattr(_get_cur(), name)
+
+class _ConnProxy:
+    def __getattr__(self, name):
+        return getattr(_get_conn(), name)
+
+cur = _CurProxy()
+conn = _ConnProxy()
+log("⚡ SQLite: thread-local + WAL")
+
+# ============ ПУЛ ДЛЯ ПАРАЛЛЕЛЬНОЙ ОБРАБОТКИ ============
+_event_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="handler")
+_peer_locks = {}
+_peer_locks_lock = threading.Lock()
+
+def _get_peer_lock(peer_id):
+    with _peer_locks_lock:
+        lock = _peer_locks.get(peer_id)
+        if lock is None:
+            lock = threading.Lock()
+            _peer_locks[peer_id] = lock
+        return lock
 
 def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 100,
@@ -249,7 +284,6 @@ def init_db():
     cur.execute("INSERT OR IGNORE INTO bot_settings(key,value) VALUES(?,?)", ("drone_case_active","0"))
     cur.execute("INSERT OR IGNORE INTO bot_settings(key,value) VALUES(?,?)", ("season_active","0"))
 
-    # ===== ИНДЕКСЫ ДЛЯ СКОРОСТИ =====
     for idx_sql in [
         "CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance DESC)",
         "CREATE INDEX IF NOT EXISTS idx_users_level ON users(level DESC)",
@@ -279,11 +313,11 @@ try:
 except Exception as e:
     log(f"❌ Ошибка БД: {e}"); traceback.print_exc(file=sys.stdout); raise SystemExit(1)
 
-# ============ ЗАЩИТА ОТ ДУБЛИКАТОВ (РАСШИРЕНА) ============
+# ============ ЗАЩИТА ОТ ДУБЛИКАТОВ ============
 _processed_ids = {}
 _processed_lock = threading.Lock()
-DEDUP_TTL = 600          # 10 минут
-DEDUP_MAX = 10000        # держим до 10k ключей
+DEDUP_TTL = 600
+DEDUP_MAX = 10000
 
 def is_duplicate(peer_id, msg_id):
     key = f"{peer_id}_{msg_id}"
@@ -350,21 +384,89 @@ def style_emoji(): return style_cfg()["emoji"]
 def style_bonus(): return style_cfg()["bonus"]
 def style_name(): return style_cfg()["name"]
 
-# ============ ХЕЛПЕРЫ ЮЗЕРА ============
+# ============ КЕШИ (главный буст скорости) ============
+_user_cache = {}
+_user_cache_lock = threading.Lock()
+USER_CACHE_TTL = 5.0
+
+_priority_cache = {}
+_priority_cache_lock = threading.Lock()
+PRIORITY_CACHE_TTL = 15.0
+
+_ban_cache = {}
+_ban_cache_lock = threading.Lock()
+BAN_CACHE_TTL = 15.0
+
+_disabled_cache = {}
+_disabled_cache_lock = threading.Lock()
+DISABLED_CACHE_TTL = 10.0
+
+_silence_cache = {}
+_silence_cache_lock = threading.Lock()
+SILENCE_CACHE_TTL = 30.0
+
+_title_bonus_cache = {}
+_title_bonus_lock = threading.Lock()
+TITLE_BONUS_TTL = 60.0
+
+_name_cache = {}
+NAME_CACHE_TTL = 1800
+
+def _invalidate_user(uid):
+    with _user_cache_lock:
+        _user_cache.pop(uid, None)
+
+def _invalidate_priority(uid):
+    with _priority_cache_lock:
+        _priority_cache.pop(uid, None)
+
+def _invalidate_ban(uid):
+    with _ban_cache_lock:
+        _ban_cache.pop(uid, None)
+
+def _invalidate_disabled(peer_id):
+    with _disabled_cache_lock:
+        _disabled_cache.pop(peer_id, None)
+
+def _invalidate_silence(chat_id):
+    with _silence_cache_lock:
+        _silence_cache.pop(chat_id, None)
+
+# ============ ХЕЛПЕРЫ ЮЗЕРА (с кешем) ============
 def get_user(uid):
-    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,)); r = cur.fetchone()
-    if not r:
-        cur.execute("INSERT INTO users(user_id) VALUES(?)", (uid,)); conn.commit()
-        cur.execute("SELECT * FROM users WHERE user_id=?", (uid,)); r = cur.fetchone()
-    return r
+    """Возвращает dict юзера (кеш 5 сек)"""
+    now = time.time()
+    with _user_cache_lock:
+        cached = _user_cache.get(uid)
+        if cached and now - cached[1] < USER_CACHE_TTL:
+            return cached[0]
+
+    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO users(user_id) VALUES(?)", (uid,))
+        conn.commit()
+        cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+        row = cur.fetchone()
+
+    if row is None:
+        return {}
+
+    cols = [d[0] for d in cur.description]
+    d = dict(zip(cols, row))
+    with _user_cache_lock:
+        _user_cache[uid] = (d, now)
+        if len(_user_cache) > 10000:
+            cutoff = now - 30
+            for u in [k for k, v in _user_cache.items() if v[1] < cutoff]:
+                del _user_cache[u]
+    return d
 
 def ufield(uid, field, default=None):
-    get_user(uid)
-    try:
-        cur.execute(f"SELECT {field} FROM users WHERE user_id=?", (uid,))
-        r = cur.fetchone()
-        return r[0] if r and r[0] is not None else default
-    except: return default
+    d = get_user(uid)
+    if not d: return default
+    v = d.get(field)
+    return v if v is not None else default
 
 def ubal(uid): return ufield(uid, "balance", 0)
 def ubank(uid): return ufield(uid, "bank", 0)
@@ -392,12 +494,25 @@ def is_vip(uid):
     return v and v > int(time.time())
 
 def get_password(uid): return upassword(uid)
+
 def set_password(uid, pw):
-    get_user(uid); cur.execute("UPDATE users SET password=? WHERE user_id=?", (pw, uid)); conn.commit()
+    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
+    _invalidate_user(uid)
+    cur.execute("UPDATE users SET password=? WHERE user_id=?", (pw, uid))
+    conn.commit()
+
 def upd_balance(uid, amount):
-    get_user(uid); cur.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, uid)); conn.commit()
+    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
+    _invalidate_user(uid)
+    cur.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, uid))
+    conn.commit()
+
 def upd_bank(uid, amount):
-    get_user(uid); cur.execute("UPDATE users SET bank=bank+? WHERE user_id=?", (amount, uid)); conn.commit()
+    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
+    _invalidate_user(uid)
+    cur.execute("UPDATE users SET bank=bank+? WHERE user_id=?", (amount, uid))
+    conn.commit()
+
 def get_balance(uid): return ubal(uid)
 def get_bank(uid): return ubank(uid)
 
@@ -431,12 +546,21 @@ def get_priority_emoji(priority):
 
 def get_priority(uid):
     if uid in OWNERS: return 101
+    now = time.time()
+    with _priority_cache_lock:
+        cached = _priority_cache.get(uid)
+        if cached and now - cached[1] < PRIORITY_CACHE_TTL:
+            return cached[0]
     p = upriority(uid)
-    if p and p > 0: return p
-    cur.execute("SELECT r.priority FROM global_roles gr JOIN roles r ON r.name=gr.role WHERE gr.user_id=?", (uid,))
-    r2 = cur.fetchone()
-    if r2 and r2[0] is not None: return r2[0]
-    return 0
+    if p and p > 0:
+        result = p
+    else:
+        cur.execute("SELECT r.priority FROM global_roles gr JOIN roles r ON r.name=gr.role WHERE gr.user_id=?", (uid,))
+        r2 = cur.fetchone()
+        result = r2[0] if r2 and r2[0] is not None else 0
+    with _priority_cache_lock:
+        _priority_cache[uid] = (result, now)
+    return result
 
 def get_user_emoji(uid):
     t = utitle(uid)
@@ -450,9 +574,16 @@ def get_user_emoji(uid):
 def get_title_bonus(uid):
     title = utitle(uid)
     if not title: return 1.0, "—"
-    cur.execute("SELECT level FROM custom_titles WHERE name=?", (title,)); t = cur.fetchone()
-    if not t: return 1.5, title
-    lvl = t[0]
+    now = time.time()
+    with _title_bonus_lock:
+        cached = _title_bonus_cache.get(title)
+        if cached and now - cached[1] < TITLE_BONUS_TTL:
+            lvl = cached[0]
+        else:
+            cur.execute("SELECT level FROM custom_titles WHERE name=?", (title,))
+            t = cur.fetchone()
+            lvl = t[0] if t else 5
+            _title_bonus_cache[title] = (lvl, now)
     return round(1.0 + (lvl/5.0), 2), title
 
 def is_owner(uid):
@@ -511,8 +642,42 @@ def is_muted(uid):
     return 0
 
 def is_banned(uid):
-    cur.execute("SELECT reason FROM bans WHERE user_id=?", (uid,)); r = cur.fetchone()
-    return r[0] if r else None
+    now = time.time()
+    with _ban_cache_lock:
+        cached = _ban_cache.get(uid)
+        if cached and now - cached[1] < BAN_CACHE_TTL:
+            return cached[0]
+    cur.execute("SELECT reason FROM bans WHERE user_id=?", (uid,))
+    r = cur.fetchone()
+    result = r[0] if r else None
+    with _ban_cache_lock:
+        _ban_cache[uid] = (result, now)
+    return result
+
+def is_bot_disabled(peer_id):
+    now = time.time()
+    with _disabled_cache_lock:
+        cached = _disabled_cache.get(peer_id)
+        if cached and now - cached[1] < DISABLED_CACHE_TTL:
+            return cached[0]
+    cur.execute("SELECT peer_id FROM bot_disabled WHERE peer_id=?", (peer_id,))
+    result = bool(cur.fetchone())
+    with _disabled_cache_lock:
+        _disabled_cache[peer_id] = (result, now)
+    return result
+
+def get_chat_silence(chat_id):
+    now = time.time()
+    with _silence_cache_lock:
+        cached = _silence_cache.get(chat_id)
+        if cached and now - cached[1] < SILENCE_CACHE_TTL:
+            return cached[0]
+    cur.execute("SELECT min_priority FROM chat_silence WHERE chat_id=?", (chat_id,))
+    r = cur.fetchone()
+    result = r[0] if r else None
+    with _silence_cache_lock:
+        _silence_cache[chat_id] = (result, now)
+    return result
 
 def peer_to_chat(p): return p - 2000000000 if p >= 2000000000 else None
 def fmt(n): return f"{n:,}".replace(",", " ")
@@ -528,14 +693,6 @@ def time_left_fmt(seconds):
     if m and not d: parts.append(f"{m} мин")
     if s and not d and not h: parts.append(f"{s} сек")
     return " ".join(parts) if parts else "0 сек"
-
-def is_bot_disabled(peer_id):
-    cur.execute("SELECT peer_id FROM bot_disabled WHERE peer_id=?", (peer_id,))
-    return bool(cur.fetchone())
-
-# ============ КЕШ name_of ============
-_name_cache = {}
-NAME_CACHE_TTL = 1800
 
 def name_of(uid):
     emoji = get_user_emoji(uid)
@@ -628,14 +785,22 @@ def clear_game_state(uid):
     cur.execute("DELETE FROM game_state WHERE user_id=?", (uid,)); conn.commit()
 
 def add_exp(uid, amount):
-    get_user(uid)
+    cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
     cur.execute("UPDATE users SET exp = exp + ? WHERE user_id=?", (amount, uid))
-    e = uexp(uid); lv = ulevel(uid)
-    new_lv = min((e or 0) // 100, 999)
-    if new_lv > (lv or 0):
-        cur.execute("UPDATE users SET level=? WHERE user_id=?", (new_lv, uid)); conn.commit()
+    cur.execute("SELECT exp, level FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if not row:
+        conn.commit(); return None
+    e = row[0] or 0; lv = row[1] or 0
+    new_lv = min(e // 100, 999)
+    if new_lv > lv:
+        cur.execute("UPDATE users SET level=? WHERE user_id=?", (new_lv, uid))
+        _invalidate_user(uid)
+        conn.commit()
         return new_lv
-    conn.commit(); return None
+    _invalidate_user(uid)
+    conn.commit()
+    return None
 
 def gen_password():
     return ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=8))
@@ -748,44 +913,32 @@ def get_chat_link(peer_id):
     else: cid = peer_id
     return f"https://m.vk.ru/gim{GROUP_ID}/convo/{cid}?entrypoint=list_all"
 
-# ============ ОТПРАВКА КАРТИНКИ /СТАТА ============
+# ============ СТАТА С КАРТИНКОЙ ============
 def vk_upload_photo(peer_id, file_path):
     try:
         server = None
         try:
             server = vk.photos.getMessagesUploadServer(peer_id=peer_id)
-            log(f"📤 upload server (peer_id={peer_id}) OK")
         except Exception as e1:
-            log(f"⚠️ upload с peer_id упал: {e1}, пробую без")
             try:
                 server = vk.photos.getMessagesUploadServer()
-                log("📤 upload server (без peer_id) OK")
             except Exception as e2:
-                log(f"❌ upload без peer_id: {e2}")
+                log(f"❌ upload: {e2}")
                 return None
 
         with open(file_path, "rb") as f:
             r = requests.post(server["upload_url"], files={"photo": ("stats.png", f)}, timeout=20)
         resp = r.json()
-        log(f"📤 upload resp: {str(resp)[:200]}")
-
         if "photo" not in resp:
-            log(f"❌ нет photo в ответе: {resp}")
             return None
-
         saved = vk.photos.saveMessagesPhoto(
             photo=resp["photo"], server=resp["server"], hash=resp["hash"]
         )
-        if not saved:
-            log("❌ saveMessagesPhoto вернул пусто")
-            return None
+        if not saved: return None
         p = saved[0]
-        att = f"photo{p['owner_id']}_{p['id']}"
-        log(f"✅ Фото загружено: {att}")
-        return att
+        return f"photo{p['owner_id']}_{p['id']}"
     except Exception as e:
         log(f"❌ vk_upload_photo: {e}")
-        traceback.print_exc(file=sys.stdout)
         return None
 
 _stats_cache = {}
@@ -829,20 +982,11 @@ def send_stats_card(peer_id, uid, chat_id=None):
         try:
             vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=cached[0])
             return True
-        except Exception as e:
-            log(f"⚠️ cached send упал: {e}")
+        except: pass
 
     try:
         from stats_card import render_card
     except Exception as e:
-        log(f"❌ stats_card НЕ загружен: {type(e).__name__}: {e}")
-        return False
-
-    try:
-        from PIL import Image as _T1
-        import requests as _T2
-    except Exception as e:
-        log(f"❌ Pillow/requests не установлены: {e}")
         return False
 
     try:
@@ -850,15 +994,12 @@ def send_stats_card(peer_id, uid, chat_id=None):
         bg_url = "https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg"
         avatar_url = u.get("avatar_url", "")
         path = render_card(bg_url, u, avatar_url=avatar_url, out_path=f"stats_{uid}.png")
-        log(f"✅ Картинка сгенерирована: {path}")
     except Exception as e:
         log(f"❌ render_card: {type(e).__name__}: {e}")
-        traceback.print_exc(file=sys.stdout)
         return False
 
     att = vk_upload_photo(peer_id, path)
     if not att:
-        log(f"❌ Не удалось загрузить фото для peer={peer_id}")
         try: os.remove(path)
         except: pass
         return False
@@ -866,12 +1007,11 @@ def send_stats_card(peer_id, uid, chat_id=None):
     try:
         vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=att)
         _stats_cache[uid] = (att, now)
-        log(f"✅ /стата отправлена (peer={peer_id}, att={att})")
         try: os.remove(path)
         except: pass
         return True
     except Exception as e:
-        log(f"❌ Финальный send упал: {e}")
+        log(f"❌ send stats: {e}")
         try: os.remove(path)
         except: pass
         return False
@@ -1112,6 +1252,7 @@ def do_raid(peer_id, uid, city_name):
 
     upd_balance(uid, -RAID_COST)
     cur.execute("UPDATE users SET raid_last=? WHERE user_id=?", (now, uid)); conn.commit()
+    _invalidate_user(uid)
 
     cfg = style_cfg()
     cur.execute("SELECT flag FROM countries WHERE name=?", (cc,)); cf = cur.fetchone()
@@ -1325,6 +1466,7 @@ def apply_drone_reward(uid, mult):
         drone_name = random.choice(OTHER_DRONES)
 
     if mult > cur_mult:
+        _invalidate_user(uid)
         cur.execute("UPDATE users SET drone_mult=?, drone_name=? WHERE user_id=?", (mult, drone_name, uid))
         conn.commit()
         return drone_name, mult, True
@@ -1342,19 +1484,19 @@ def open_case(peer_id, uid, case_key):
         cur.execute("SELECT value FROM bot_settings WHERE key='drone_case_active'")
         r = cur.fetchone()
         if not r or r[0] != "1":
-            return send(peer_id, "⛔ Кейс Дрон сейчас закрыт. Владелец должен его включить.")
+            return send(peer_id, "⛔ Кейс Дрон сейчас закрыт.")
 
     if case.get("season"):
         cur.execute("SELECT value FROM bot_settings WHERE key='season_active'")
         r = cur.fetchone()
         if not r or r[0] != "1":
-            return send(peer_id, "⛔ Сезонные кейсы сейчас закрыты. Владелец должен их включить.")
+            return send(peer_id, "⛔ Сезонные кейсы сейчас закрыты.")
 
     if case_key == "daily":
         last = ufield(uid, "daily_case_last", 0) or 0
         left = case["cooldown"] - (int(time.time()) - last)
         if left > 0:
-            return send(peer_id, f"⏳ Ежедневный кейс будет доступен через: {time_left_fmt(left)}")
+            return send(peer_id, f"⏳ Ежедневный кейс через: {time_left_fmt(left)}")
 
     if case["price"] > 0:
         if get_balance(uid) < case["price"]:
@@ -1363,6 +1505,7 @@ def open_case(peer_id, uid, case_key):
 
     if case_key == "daily":
         cur.execute("UPDATE users SET daily_case_last=? WHERE user_id=?", (int(time.time()), uid)); conn.commit()
+        _invalidate_user(uid)
 
     rtype, val = roll_case_reward(case_key)
 
@@ -1372,6 +1515,7 @@ def open_case(peer_id, uid, case_key):
         add_exp(uid, val); reward = f"⚡ +{fmt(val)} exp"
     elif rtype == "rep":
         cur.execute("UPDATE users SET rep=rep+? WHERE user_id=?", (val, uid)); conn.commit()
+        _invalidate_user(uid)
         reward = f"🌟 +{fmt(val)} репутации"
     elif rtype == "drone":
         drone_name, mult, upgraded = apply_drone_reward(uid, val)
@@ -1422,7 +1566,7 @@ def show_cases_menu(peer_id, uid):
             else: row = f"{pct}% — ???"
             txt += f"       • {row}\n"
         txt += "\n"
-    txt += f"{style_div()}\n📝 Нажми на кнопку для открытия"
+    txt += f"{style_div()}\n📝 Нажми на кнопку"
 
     btns = []; row = []
     for key, case in CASES.items():
@@ -1444,9 +1588,10 @@ def play_admin_event(peer_id, uid, chat_id):
     now = int(time.time())
     last = ufield(uid, "aevent_last", 0) or 0
     if now - last < 86400:
-        return send(peer_id, f"⏳ Ты уже открывал админ-ивент.\nСледующий через: {time_left_fmt(86400 - (now - last))}")
+        return send(peer_id, f"⏳ Следующий через: {time_left_fmt(86400 - (now - last))}")
 
     cur.execute("UPDATE users SET aevent_last=? WHERE user_id=?", (now, uid)); conn.commit()
+    _invalidate_user(uid)
 
     roll = random.random()
     if roll < 0.10:
@@ -1457,6 +1602,7 @@ def play_admin_event(peer_id, uid, chat_id):
         reward = f"⚡ +{amt} exp"
     else:
         cur.execute("UPDATE users SET rep=rep+10 WHERE user_id=?", (uid,)); conn.commit()
+        _invalidate_user(uid)
         reward = "🌟 +10 Репутации"
 
     send(peer_id, f"{style_div()}\n     🚨 АДМИН-ИВЕНТ 🚨\n{style_div()}\n\n"
@@ -1473,7 +1619,8 @@ def pr_send_to_piar_chats(body):
     for (cp,) in chats:
         try:
             vk.messages.send(peer_id=cp, message=pr_text, random_id=get_random_id())
-            sent += 1; time.sleep(0.34)
+            sent += 1
+            time.sleep(0.1)
         except: pass
     return sent
 
@@ -1514,9 +1661,9 @@ def build_help_user():
   /дартс /краш /блэкджек /мины /башня /гонка /рыбалка
 
 🎁 КЕЙСЫ
-  /кейс — меню всех кейсов со шансами
-  /моикейсы — мои активные кулдауны
-  /топ кейсы — топ игроков по открытиям
+  /кейс — меню всех кейсов
+  /моикейсы — мои кулдауны
+  /топ кейсы — топ игроков
 
 💼 РАБОТА И БИЗНЕС
   /работы /устроиться /уволиться /работать
@@ -1529,20 +1676,18 @@ def build_help_user():
 
 🌍 СТРАНА
   /страны /страна
-  /гражданство [название] — вступить в страну
+  /гражданство [название]
   /паспорт /казна /граждане /армия /города
 
 💞 БРАК
-  /брак <юзер> — жениться/выйти замуж
-  /развод — развестись
-  /топ брак — самые долгие браки
+  /брак <юзер> /развод /топ брак
 
 📢 СОЦИАЛЬНОЕ
   /пиар /pr_my /promo /подписка /донат
   /report /offer /ивент /мафия /ежедневно
 
-🎟️ /promo <код> — активировать промокод
-⚔️ /война <страна> — только для генералов
+🎟️ /promo <код>
+⚔️ /война <страна> — генералам
 
 🏆 ТОПЫ
   /топ баланс | /топ сообщения | /топ маты
@@ -1567,8 +1712,8 @@ def build_help_admin():
 📩 ТИКЕТЫ
   /tickets /adt <номер> <ответ>
 
-🚨 /админ_ивент — открыть админ-кейс (20+)
-📊 /мойстат — моя статистика
+🚨 /админ_ивент — кейс (20+)
+📊 /мойстат
 🎁 /раздача
 👑 /adminpanel <пароль>
 📖 /ahelp
@@ -1589,7 +1734,7 @@ def build_help_owner():
   /выдать /вернуть /обнулить /вайп
   /removestaff /setpass
 
-👑 ПРЕЗИДЕНТ И ДОЛЖНОСТИ
+👑 ПРЕЗИДЕНТ
   /президент <юзер> <страна>
   /снятьпрезидента <страна>
   /должность <юзер> <страна> <позиция>
@@ -1603,17 +1748,15 @@ def build_help_owner():
   /pr_orders /pr_stats /pr_ok <id> /pr_no <id> /pr_stop <id>
 
 🛸 ДРОН-КЕЙС
-  /дрон_кейс_вкл — включить (100+)
-  /дрон_кейс_выкл — выключить (100+)
+  /дрон_кейс_вкл /дрон_кейс_выкл
 
 🎃 СЕЗОННЫЕ КЕЙСЫ
-  /сезон_вкл — включить (100+)
-  /сезон_выкл — выключить (100+)
+  /сезон_вкл /сезон_выкл
 
 🌍 /удалитьстрану /улучшить_страну
 ⚔️ /война /захват /мир /запуск /дрон
 
-📊 /мойстат — моя статистика
+📊 /мойстат
 🔐 /adminpanel <пароль>
 📖 /ghelp
 {style_div()}"""
@@ -1709,6 +1852,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         else:
             cur.execute("UPDATE users SET msg_count=msg_count+1 WHERE user_id=?", (uid,))
         conn.commit()
+        _invalidate_user(uid)
 
     wc = len(text.split())
     if wc >= 3 and not text.startswith("/"):
@@ -1716,22 +1860,24 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if now - (last or 0) >= 30:
             gained = min(wc // 3, 5)
             cur.execute("UPDATE users SET exp_last=? WHERE user_id=?", (now, uid)); conn.commit()
+            _invalidate_user(uid)
             newlv = add_exp(uid, gained)
             if newlv: send(peer_id, f"🎉 {mention(uid)} достиг уровня *{newlv}* — {get_title(newlv)}!")
 
     args = text.split(); cmd = args[0].lower() if args else ""
     chat_id = peer_to_chat(peer_id)
 
-    # Обработка /stop и /start идет до всех проверок
     if cmd == "/stop":
         if not is_owner(uid): return
         cur.execute("INSERT OR REPLACE INTO bot_disabled(peer_id,since) VALUES(?,?)", (peer_id, int(time.time())))
-        conn.commit(); send(peer_id, "🛑 Выключен"); return
+        conn.commit(); _invalidate_disabled(peer_id)
+        send(peer_id, "🛑 Выключен"); return
 
     if cmd == "/start":
         if is_bot_disabled(peer_id):
             if not is_owner(uid): return
             cur.execute("DELETE FROM bot_disabled WHERE peer_id=?", (peer_id,)); conn.commit()
+            _invalidate_disabled(peer_id)
             send(peer_id, "✅ Активен!"); return
         send(peer_id, f"{header('БОЕВОЙ БОТ')}\n\n  👤 {name_of(uid)}\n  💰 {fmt(get_balance(uid))} 💵\n  🏦 {fmt(get_bank(uid))} 💵\n  🏆 Ур. {ulevel(uid)}\n\n  📖 /help", kb_main()); return
 
@@ -1750,14 +1896,14 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         now = int(time.time()); ln = ufield(uid, "mute_notify", 0) or 0
         if peer_id < 2000000000 or now - ln > 60:
             cur.execute("UPDATE users SET mute_notify=? WHERE user_id=?", (now, uid)); conn.commit()
+            _invalidate_user(uid)
             send_uid(uid, f"{style_div()}\n     🔇 МУТ\n{style_div()}\n\n  ⏳ Осталось: {time_left_fmt(ml)}\n{style_div()}")
         return
 
     if chat_id and cmd not in ("/тишина","/stop","/start","/меню") and not cmd.startswith("/adminpanel"):
-        cur.execute("SELECT min_priority FROM chat_silence WHERE chat_id=?", (chat_id,))
-        r = cur.fetchone()
-        if r and r[0] is not None and r[0] > 0:
-            if get_priority(uid) < r[0] and not is_owner(uid):
+        min_p = get_chat_silence(chat_id)
+        if min_p is not None and min_p > 0:
+            if get_priority(uid) < min_p and not is_owner(uid):
                 if message_id: delete_message(peer_id, message_id)
                 return
 
@@ -1808,14 +1954,14 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         r = cur.fetchone(); drone_active = r and r[0] == "1"
         last = ufield(uid, "drone_last", 0) or 0
         left_drone = max(0, 86400 - (now - last))
-        if not drone_active: status = "🔴 Кейс закрыт владельцем"
+        if not drone_active: status = "🔴 Закрыт"
         elif left_drone == 0: status = "✅ Доступен"
         else: status = f"⏳ {time_left_fmt(left_drone)}"
         txt += f"  🛸 Кейс Дрон\n     {status}\n     📊 Открыто: {get_case_count(uid, 'drone')}\n\n"
 
         last = ufield(uid, "aevent_last", 0) or 0
         left_aevent = max(0, 86400 - (now - last))
-        if get_priority(uid) < 20: status = "🔒 Только 20+"
+        if get_priority(uid) < 20: status = "🔒 20+"
         elif left_aevent == 0: status = "✅ Доступен"
         else: status = f"⏳ {time_left_fmt(left_aevent)}"
         txt += f"  🚨 Админ-ивент\n     {status}\n\n"
@@ -1825,7 +1971,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
                        ORDER BY count DESC""", (uid,))
         rows = cur.fetchall()
         if rows:
-            txt += f"  📊 Остальные открытия:\n"
+            txt += f"  📊 Остальные:\n"
             for ck, cnt in rows:
                 case_name = CASES.get(ck, {}).get("name", ck)
                 txt += f"     • {case_name}: {cnt}\n"
@@ -1839,7 +1985,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("""SELECT user_id, SUM(count) as total FROM case_stats 
                        GROUP BY user_id ORDER BY total DESC LIMIT 10""")
         rows = cur.fetchall()
-        if not rows: return send(peer_id, "❌ Пока никто не открывал кейсы")
+        if not rows: return send(peer_id, "❌ Пока никто не открывал")
         m = ["🥇","🥈","🥉"] + ["🔹"]*7
         txt = header("🎁 ТОП-10 ПО КЕЙСАМ")+"\n\n"
         for i, (u, cnt) in enumerate(rows):
@@ -1851,8 +1997,8 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         state = "1" if cmd == "/сезон_вкл" else "0"
         cur.execute("INSERT OR REPLACE INTO bot_settings(key,value) VALUES('season_active',?)", (state,))
         conn.commit()
-        msg = "🟢 Сезонные кейсы ВКЛЮЧЕНЫ" if state == "1" else "🔴 Сезонные кейсы ВЫКЛЮЧЕНЫ"
-        send(peer_id, f"{msg}"); return
+        msg = "🟢 Сезонные ВКЛ" if state == "1" else "🔴 Сезонные ВЫКЛ"
+        send(peer_id, msg); return
 
     if cmd == "/админ_ивент":
         return play_admin_event(peer_id, uid, chat_id)
@@ -1862,20 +2008,23 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         state = "1" if cmd == "/дрон_кейс_вкл" else "0"
         cur.execute("INSERT OR REPLACE INTO bot_settings(key,value) VALUES('drone_case_active',?)", (state,))
         conn.commit()
-        msg = "🟢 Дрон-кейс ВКЛЮЧЕН" if state == "1" else "🔴 Дрон-кейс ВЫКЛЮЧЕН"
-        send(peer_id, f"{msg}\nТеперь доступен всем игрокам."); return
+        msg = "🟢 Дрон-кейс ВКЛ" if state == "1" else "🔴 Дрон-кейс ВЫКЛ"
+        send(peer_id, msg); return
 
     # ============ МОДЕРАЦИЯ ============
     if cmd == "/warn":
         if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t or is_owner(t) or is_admin(t): return
-        get_user(t); cur.execute("UPDATE users SET warns=warns+1 WHERE user_id=?", (t,)); conn.commit()
+        cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
+        cur.execute("UPDATE users SET warns=warns+1 WHERE user_id=?", (t,)); conn.commit()
+        _invalidate_user(t)
         cur.execute("SELECT warns FROM users WHERE user_id=?", (t,)); w = cur.fetchone()[0]
         inc_admin_stat(uid, "warns")
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
         if w >= 3:
             cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t,"3/3 варна")); conn.commit()
+            _invalidate_ban(t)
             if chat_id: kick_user(chat_id, t)
             inc_admin_stat(uid, "bans")
             send(peer_id, punish_card("ban", t, "3/3 варна (автобан)", uid))
@@ -1888,7 +2037,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/unwarn":
         if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
-        if t: cur.execute("UPDATE users SET warns=MAX(0,warns-1) WHERE user_id=?", (t,)); conn.commit()
+        if t:
+            cur.execute("UPDATE users SET warns=MAX(0,warns-1) WHERE user_id=?", (t,)); conn.commit()
+            _invalidate_user(t)
         return
 
     if cmd == "/mute":
@@ -1899,8 +2050,10 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: m = 60
         if is_owner(t) or is_admin(t): return
         reason = " ".join(args[3:]) if len(args) > 3 else "не указана"
-        get_user(t); until = int(time.time()) + m*60
+        cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
+        until = int(time.time()) + m*60
         cur.execute("UPDATE users SET mute_until=? WHERE user_id=?", (until, t)); conn.commit()
+        _invalidate_user(t)
         inc_admin_stat(uid, "mutes")
         send(peer_id, punish_card("mute", t, f"{reason} (на {time_left_fmt(m*60)})", uid))
         send_uid(t, f"🔇 Ты заглушен на {time_left_fmt(m*60)}. Причина: {reason}"); return
@@ -1908,8 +2061,11 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd == "/unmute":
         if not can_punish(uid, chat_id): return send(peer_id, "❌ Бот не админ в чате")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
-        if t: cur.execute("UPDATE users SET mute_until=0, mute_notify=0 WHERE user_id=?", (t,)); conn.commit()
-        send(peer_id, f"✅ {mention(t)} размучен"); return
+        if t:
+            cur.execute("UPDATE users SET mute_until=0, mute_notify=0 WHERE user_id=?", (t,)); conn.commit()
+            _invalidate_user(t)
+            send(peer_id, f"✅ {mention(t)} размучен")
+        return
 
     if cmd == "/kick":
         if not can_punish(uid, chat_id) or not chat_id: return send(peer_id, "❌ Бот не админ в чате")
@@ -1925,6 +2081,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not t or is_owner(t) or is_admin(t): return
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
         cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t, reason)); conn.commit()
+        _invalidate_ban(t)
         inc_admin_stat(uid, "bans")
         if chat_id: kick_user(chat_id, t)
         send(peer_id, punish_card("ban", t, reason, uid))
@@ -1935,6 +2092,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if t:
             cur.execute("DELETE FROM bans WHERE user_id=?", (t,)); conn.commit()
+            _invalidate_ban(t)
             send(peer_id, f"✅ {mention(t)} разбанен")
         return
 
@@ -1946,6 +2104,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not t or t in OWNERS: return
         reason = " ".join(args[2:]) if len(args)>2 else "не указана"
         cur.execute("INSERT OR REPLACE INTO bans(user_id,reason) VALUES(?,?)", (t, reason)); conn.commit()
+        _invalidate_ban(t)
         inc_admin_stat(uid, "bans")
         kicked = 0
         cur.execute("SELECT chat_id FROM builds"); chats = cur.fetchall()
@@ -1963,7 +2122,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         except: days = 30
         if not t: return
         until = int(time.time()) + days*86400
+        cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
         cur.execute("UPDATE users SET vip_until=? WHERE user_id=?", (until, t)); conn.commit()
+        _invalidate_user(t)
         send(peer_id, f"💠 {mention(t)} выдан VIP на {days} дней")
         send_uid(t, f"💠 Тебе выдан VIP на {days} дней!"); return
 
@@ -1982,7 +2143,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         try: amt = int(args[2]) if len(args)>2 else 10
         except: amt = 10
         if not t: return
+        cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
         cur.execute("UPDATE users SET rep=rep+? WHERE user_id=?", (amt, t)); conn.commit()
+        _invalidate_user(t)
         send(peer_id, f"🌟 {mention(t)} выдано {amt} репутации"); return
 
     # ============ СТАТА ============
@@ -2011,12 +2174,10 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
                f"Monster PROFILE\n"
                f"━━━━━━━━━━━━━━━━━━━━\n\n"
                f"👑  Должность   ·  {pos}\n"
-               f"🎖️  Привилегия  ·  Игрок  (стандарт)\n"
+               f"🎖️  Привилегия  ·  Игрок\n"
                f"💠  VIP         ·  {vip}\n"
                f"🎭  Роль в чате ·  {chat_role}  ·  приоритет {priority}\n\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n"
                f"📊  АКТИВНОСТЬ\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n\n"
                f"📝  Сообщений   ·  {fmt(msgs)}\n"
                f"⭐  Уровень     ·  {lvl} / 999\n"
                f"✨  Опыт        ·  {exp} / {need} ({pct}%) [{prog}] XP\n"
@@ -2025,22 +2186,23 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
                f"🌟  Репутация   ·  {rep}\n"
                f"📛  Ник         ·  {nick}\n\n"
                f"🛸  Дрон        ·  {drone_name}\n"
-               f"📈  Множитель   ·  ×{drone_mult} к играм и бизнесу\n\n"
-               f"━━━━━━━━━━━━━━━━━━━━\n\n"
-               f"🔥  Статус:  {get_title(lvl)}\n\n"
+               f"📈  Множитель   ·  ×{drone_mult}\n\n"
+               f"🔥  Статус:  {get_title(lvl)}\n"
                f"━━━━━━━━━━━━━━━━━━━━")
         send(peer_id, txt, kb_back()); return
 
     # ============ БРАК ============
     if cmd == "/брак":
-        if umarried_to(uid): return send(peer_id, "❌ Ты уже в браке. Используй /развод")
+        if umarried_to(uid): return send(peer_id, "❌ Ты уже в браке. /развод")
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t or t == uid: return send(peer_id, "📝 /брак @юзер")
-        if umarried_to(t): return send(peer_id, "❌ Этот человек уже в браке")
+        if umarried_to(t): return send(peer_id, "❌ Уже в браке")
         now = int(time.time())
+        cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
         cur.execute("UPDATE users SET married_to=?, married_date=? WHERE user_id=?", (t, now, uid))
         cur.execute("UPDATE users SET married_to=?, married_date=? WHERE user_id=?", (uid, now, t))
         conn.commit()
+        _invalidate_user(uid); _invalidate_user(t)
         send(peer_id, f"💞 {mention(uid)} и {mention(t)} теперь в браке!\n🎉 Совет да любовь!"); return
 
     if cmd == "/развод":
@@ -2048,7 +2210,8 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not p: return send(peer_id, "❌ Ты не в браке")
         cur.execute("UPDATE users SET married_to=0, married_date=0 WHERE user_id IN (?,?)", (uid, p))
         conn.commit()
-        send(peer_id, f"💔 Брак между {mention(uid)} и {mention(p)} расторгнут."); return
+        _invalidate_user(uid); _invalidate_user(p)
+        send(peer_id, f"💔 Брак расторгнут."); return
 
     # ============ ТОПЫ ============
     if cmd in ("/топ", "топ"):
@@ -2062,18 +2225,18 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             cur.execute("""SELECT u1.user_id, u1.married_to, u1.married_date 
                            FROM users u1 WHERE u1.married_to > 0 AND u1.user_id < u1.married_to 
                            ORDER BY u1.married_date ASC LIMIT 10""")
-            rows = cur.fetchall(); txt = header("💞 ТОП-10 САМЫХ ДОЛГИХ БРАКОВ")+"\n\n"
+            rows = cur.fetchall(); txt = header("💞 ТОП-10 БРАКОВ")+"\n\n"
             for i, (u1, u2, dt) in enumerate(rows):
                 days = (int(time.time()) - dt) // 86400
                 txt += f"  {m[i]} {name_of(u1)} + {name_of(u2)} — {days} дн.\n"
-            if not rows: txt += "  ❌ Пока нет браков\n"
+            if not rows: txt += "  ❌ Пока нет\n"
         else:
             txt = f"{header('🏆 ТОПЫ')}\n\n  💰 /топ баланс\n  💞 /топ брак\n{style_div()}"
         send(peer_id, txt + f"\n{style_div()}", kb_back()); return
 
     # ============ БАНК ============
     if cmd == "/банк":
-        send(peer_id, f"{header('🏦 БАНК')}\n\n  👤 {name_of(uid)}\n\n  💰 Баланс: {fmt(get_balance(uid))} 💵\n  🏦 Счёт: {fmt(get_bank(uid))} 💵\n  📊 Всего: {fmt(get_balance(uid)+get_bank(uid))} 💵\n\n  📈 Доход с бизнеса идёт сюда!\n\n{style_div()}\n📝 /положить | /снять", kb_bank()); return
+        send(peer_id, f"{header('🏦 БАНК')}\n\n  👤 {name_of(uid)}\n\n  💰 Баланс: {fmt(get_balance(uid))} 💵\n  🏦 Счёт: {fmt(get_bank(uid))} 💵\n  📊 Всего: {fmt(get_balance(uid)+get_bank(uid))} 💵\n\n{style_div()}\n📝 /положить | /снять", kb_bank()); return
 
     if cmd == "/положить":
         if len(args) < 2: return
@@ -2122,7 +2285,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         c = cur.fetchone()
         if not c: return send(peer_id, f"❌ Город не найден")
         cid, cn, cc, inc, lc = c
-        if ucountry(uid) != cc and not is_owner(uid): return send(peer_id, "❌ Город не вашей страны")
+        if ucountry(uid) != cc and not is_owner(uid): return send(peer_id, "❌ Не ваша страна")
         now = int(time.time()); left = 86400 - (now - (lc or 0))
         if left > 0: return send(peer_id, f"⏳ Через {time_left_fmt(left)}")
         treasury_share = int(inc * 0.05); bank_share = inc - treasury_share
@@ -2136,53 +2299,53 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         name = " ".join(args[1:-1])
         try: price = int(args[-1])
         except: return
-        if price < 1000: return send(peer_id, "❌ Мин. цена 1000")
+        if price < 1000: return send(peer_id, "❌ Мин. 1000")
         c = ucountry(uid)
         if not c: return send(peer_id, "❌ Нет страны")
-        if get_bank(uid) < price: return send(peer_id, f"❌ Нужно {fmt(price)} 💵 в банке")
+        if get_bank(uid) < price: return send(peer_id, f"❌ Нужно {fmt(price)} 💵")
         cur.execute("SELECT id FROM cities WHERE LOWER(name)=LOWER(?)", (name,))
-        if cur.fetchone(): return send(peer_id, "❌ Город уже есть")
+        if cur.fetchone(): return send(peer_id, "❌ Уже есть")
         upd_bank(uid, -price)
         cur.execute("INSERT INTO cities(name,country,owner,is_capital) VALUES(?,?,?,0)", (name, c, uid))
         cur.execute("UPDATE countries SET cities=cities+1 WHERE name=?", (c,)); conn.commit()
-        send(peer_id, f"🏙 Город «{name}» куплен за {fmt(price)} 💵", kb_country()); return
+        send(peer_id, f"🏙 «{name}» куплен за {fmt(price)} 💵", kb_country()); return
 
     if cmd == "/построить_город":
         if len(args) < 2: return send(peer_id, "📝 /построить_город <название>")
         name = " ".join(args[1:])
         cur.execute("SELECT id,level FROM cities WHERE LOWER(name)=LOWER(?)", (name,))
         c = cur.fetchone()
-        if not c: return send(peer_id, "❌ Город не найден")
+        if not c: return send(peer_id, "❌ Не найден")
         cid, lv = c; cost = 50000 * lv
         if get_bank(uid) < cost: return send(peer_id, f"❌ Нужно {fmt(cost)} 💵")
         upd_bank(uid, -cost)
         cur.execute("UPDATE cities SET level=level+1, population=population+5000, income=income+2000, defense=defense+500 WHERE id=?", (cid,))
-        conn.commit(); send(peer_id, f"🏗 {name} прокачан до ур. {lv+1}", kb_country()); return
+        conn.commit(); send(peer_id, f"🏗 {name} → ур. {lv+1}", kb_country()); return
 
     if cmd in ("/налёт","/налет"):
         if len(args) < 2:
-            return send(peer_id, f"📝 /налёт <название города>\n\n  💰 Стоимость: {fmt(RAID_COST)} 💵\n  🎯 Шанс успеха: 40%\n  🏆 Добыча: 20% от дохода города\n  ⏳ Кулдаун: 1 час", kb_country())
+            return send(peer_id, f"📝 /налёт <город>\n\n  💰 {fmt(RAID_COST)} 💵\n  🎯 40%\n  🏆 20% от дохода\n  ⏳ 1 час", kb_country())
         return do_raid(peer_id, uid, " ".join(args[1:]))
 
     # ============ ВОЙНА / ПРЕЗИДЕНТ ============
     if cmd == "/война":
         c = ucountry(uid)
-        if not c: return send(peer_id, "❌ Ты не гражданин страны")
+        if not c: return send(peer_id, "❌ Нет страны")
         position = get_position(uid)
         if position != "Генерал" and not is_owner(uid):
-            return send(peer_id, f"❌ /война доступна только генералам страны\n\n  🌍 Твоя страна: {c}\n  💼 Твоя должность: {position or 'Гражданин'}")
+            return send(peer_id, f"❌ Только генералам\n\n  🌍 {c}\n  💼 {position or 'Гражданин'}")
         if len(args) < 2: return send(peer_id, "📝 /война <страна>")
         target_name = " ".join(args[1:]).strip()
         cur.execute("SELECT name,flag FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{target_name}%",))
         co = cur.fetchone()
-        if not co: return send(peer_id, f"❌ Страна «{target_name}» не найдена")
+        if not co: return send(peer_id, f"❌ Страна не найдена")
         target_country, target_flag = co
-        if target_country == c: return send(peer_id, "❌ Нельзя объявить войну своей стране")
+        if target_country == c: return send(peer_id, "❌ Своя страна")
         cur.execute("SELECT id FROM wars WHERE attacker=? AND defender=? AND active=1", (c, target_country))
-        if cur.fetchone(): return send(peer_id, f"❌ Война уже идёт")
+        if cur.fetchone(): return send(peer_id, f"❌ Уже идёт")
         cur.execute("INSERT INTO wars(attacker,defender,started,active) VALUES(?,?,?,1)", (c, target_country, int(time.time()))); conn.commit()
         cur.execute("SELECT flag FROM countries WHERE name=?", (c,)); cf = cur.fetchone(); my_flag = cf[0] if cf else "🏳️"
-        txt = f"{style_div()}\n     ⚔️ ВОЙНА ОБЪЯВЛЕНА\n{style_div()}\n\n  {my_flag} {c}\n     ⚔️ ⚔️ ⚔️\n  {target_flag} {target_country}\n\n  👮 Генерал: {mention(uid)}\n  📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n{style_div()}"
+        txt = f"{style_div()}\n     ⚔️ ВОЙНА\n{style_div()}\n\n  {my_flag} {c}\n     ⚔️ ⚔️ ⚔️\n  {target_flag} {target_country}\n\n  👮 {mention(uid)}\n{style_div()}"
         send(peer_id, txt)
         cur.execute("SELECT president, owner FROM countries WHERE name=?", (target_country,)); pres = cur.fetchone()
         if pres:
@@ -2205,10 +2368,12 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         old_country = ucountry(t)
         if old_country != country_name:
             if old_country: cur.execute("DELETE FROM members WHERE user_id=?", (t,))
+            cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
             cur.execute("UPDATE users SET country=? WHERE user_id=?", (country_name, t))
         cur.execute("UPDATE countries SET president=? WHERE name=?", (t, country_name))
         cur.execute("INSERT OR REPLACE INTO members(user_id,country,position) VALUES(?,?,?)", (t, country_name, "Президент")); conn.commit()
-        txt = (f"{style_div()}\n     👑 ПРЕЗИДЕНТ НАЗНАЧЕН\n{style_div()}\n\n  👤 {mention(t)}\n  🌍 {flag} {country_name}\n  👮 Назначил: {mention(uid)}\n\n{style_div()}")
+        _invalidate_user(t)
+        txt = (f"{style_div()}\n     👑 ПРЕЗИДЕНТ\n{style_div()}\n\n  👤 {mention(t)}\n  🌍 {flag} {country_name}\n  👮 {mention(uid)}\n{style_div()}")
         send(peer_id, txt)
         try: send_uid(t, txt)
         except: pass
@@ -2222,10 +2387,12 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cname = args[2]; position = " ".join(args[3:])
         cur.execute("SELECT name,flag FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{cname}%",))
         co = cur.fetchone()
-        if not co: return send(peer_id, f"❌ Страна не найдена")
+        if not co: return send(peer_id, f"❌ Не найдена")
         country_name, flag = co
         cur.execute("INSERT OR REPLACE INTO members(user_id,country,position) VALUES(?,?,?)", (t, country_name, position))
+        cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
         cur.execute("UPDATE users SET country=? WHERE user_id=?", (country_name, t)); conn.commit()
+        _invalidate_user(t)
         send(peer_id, f"✅ {mention(t)} — {position} в {flag} {country_name}")
         try: send_uid(t, f"🎖️ Ты назначен: {position}\n🌍 {flag} {country_name}")
         except: pass
@@ -2293,13 +2460,13 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("SELECT chat_id,title,type FROM builds ORDER BY type DESC, chat_id"); rows = cur.fetchall()
         piar = [r for r in rows if (r[2] or "").upper() == "PIAR"]
         other = [r for r in rows if (r[2] or "").upper() != "PIAR"]
-        txt = f"{header('ПРИВЯЗАННЫЕ ЧАТЫ')}\n\n  📢 PIAR ({len(piar)}):\n"
+        txt = f"{header('ЧАТЫ')}\n\n  📢 PIAR ({len(piar)}):\n"
         if piar:
             for c,t,tp in piar: txt += f"     ✅ {t} (id {c})\n"
         else: txt += "     ❌ Нет\n"
         txt += f"\n  🏛 Остальные ({len(other)}):\n"
         for c,t,tp in other[:20]: txt += f"     • {t} (id {c})\n"
-        txt += f"\n{style_div()}\n📝 /build_piar — пометить текущий чат как PIAR"
+        txt += f"\n{style_div()}"
         send(peer_id, txt); return
 
     if cmd == "/builds":
@@ -2308,24 +2475,26 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         title = " ".join(args[1:]) if len(args)>1 else f"Беседа {chat_id}"
         btype = "PIAR" if title.strip().upper() == "PIAR" else "chat"
         cur.execute("INSERT OR REPLACE INTO builds(chat_id,peer_id,title,type,linked_by,linked_at) VALUES(?,?,?,?,?,?)", (chat_id,peer_id,title,btype,uid,int(time.time()))); conn.commit()
-        if btype == "PIAR": send(peer_id, f"✅ Чат помечен как 📢 PIAR")
+        if btype == "PIAR": send(peer_id, f"✅ PIAR")
         else: send(peer_id, f"✅ {title}")
         return
 
     if cmd == "/build_piar":
         if not is_owner(uid) or not chat_id: return
         cur.execute("INSERT OR REPLACE INTO builds(chat_id,peer_id,title,type,linked_by,linked_at) VALUES(?,?,?,?,?,?)", (chat_id, peer_id, "PIAR", "PIAR", uid, int(time.time()))); conn.commit()
-        send(peer_id, "✅ Этот чат помечен как 📢 PIAR"); return
+        send(peer_id, "✅ PIAR"); return
 
     if cmd == "/тишина":
         if not can_punish(uid, chat_id) or not chat_id: return send(peer_id, "❌ Бот не админ в чате")
         if len(args) < 2: return send(peer_id, "📝 /тишина <0-101|выкл>")
         if args[1].lower() in ("выкл","off","0"):
             cur.execute("DELETE FROM chat_silence WHERE chat_id=?", (chat_id,)); conn.commit()
+            _invalidate_silence(chat_id)
             return send(peer_id, "🔊 Выкл")
         try: p = max(0, min(101, int(args[1])))
         except: return
         cur.execute("INSERT OR REPLACE INTO chat_silence(chat_id,min_priority) VALUES(?,?)", (chat_id, p)); conn.commit()
+        _invalidate_silence(chat_id)
         send(peer_id, f"🤫 {p}+"); return
 
     # ============ ИГРЫ ============
@@ -2357,6 +2526,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         amt = int(random.randint(100, 900000) * style_bonus())
         upd_balance(uid, amt); add_exp(uid, 5)
         cur.execute("UPDATE users SET last_bonus=? WHERE user_id=?", (int(time.time()), uid)); conn.commit()
+        _invalidate_user(uid)
         send(peer_id, f"🎁 +{fmt(amt)} 💵 | +5 exp\n⏰ Через 24ч"); return
 
     if cmd in ("/ежедневно","/daily"):
@@ -2366,6 +2536,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             return send(peer_id, f"⏳ {h}ч {m_}мин")
         rw = int(50000 * style_bonus()); upd_balance(uid, rw)
         cur.execute("UPDATE users SET daily=? WHERE user_id=?", (now, uid)); conn.commit()
+        _invalidate_user(uid)
         add_exp(uid, 20); send(peer_id, f"🎁 +{fmt(rw)} 💵 | +20 exp"); return
 
     if cmd == "/передать":
@@ -2383,7 +2554,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         try:
             r = vk.groups.isMember(group_id=GROUP_ID, user_id=uid)
             if r:
-                cur.execute("UPDATE users SET subscription=1 WHERE user_id=?", (uid,)); upd_balance(uid,50000); conn.commit()
+                cur.execute("UPDATE users SET subscription=1 WHERE user_id=?", (uid,)); conn.commit()
+                _invalidate_user(uid)
+                upd_balance(uid,50000)
                 send(peer_id, "🎉 +50 000 💵")
             else: send(peer_id, f"📰 https://vk.com/club{GROUP_ID}")
         except: send(peer_id, f"📰 https://vk.com/club{GROUP_ID}")
@@ -2399,37 +2572,39 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for n,s,ex,me in rows:
             lk = "✅" if e >= me else "🔒"
             sb = int(s * bonus) if bonus > 1.0 else s
-            txt += f"  {lk} {n} — {fmt(sb)} 💵 (+{ex} exp) [нужно {me} exp]\n"
+            txt += f"  {lk} {n} — {fmt(sb)} 💵 (+{ex} exp) [{me}]\n"
         send(peer_id, txt + f"\n{style_div()}\n📝 /устроиться <название>"); return
 
     if cmd == "/устроиться":
         if len(args) < 2: return send(peer_id, "📝 /устроиться <название>")
         job = " ".join(args[1:])
         cur.execute("SELECT name,salary,exp,min_exp FROM jobs WHERE LOWER(name)=LOWER(?)", (job,)); j = cur.fetchone()
-        if not j: return send(peer_id, "❌ Работа не найдена")
-        if uexp(uid) < j[3]: return send(peer_id, f"❌ Для этой работы нужно {j[3]} exp (у тебя {uexp(uid)})")
+        if not j: return send(peer_id, "❌ Не найдена")
+        if uexp(uid) < j[3]: return send(peer_id, f"❌ Нужно {j[3]} exp (у тебя {uexp(uid)})")
         cur.execute("UPDATE users SET work=?, work_last=0 WHERE user_id=?", (j[0], uid)); conn.commit()
-        send(peer_id, f"💼 Ты устроен: {j[0]}", kb_back()); return
+        _invalidate_user(uid)
+        send(peer_id, f"💼 Устроен: {j[0]}", kb_back()); return
 
     if cmd == "/уволиться":
         cur.execute("UPDATE users SET work=NULL WHERE user_id=?", (uid,)); conn.commit()
-        send(peer_id, "❌ Ты уволен"); return
+        _invalidate_user(uid)
+        send(peer_id, "❌ Уволен"); return
 
     if cmd == "/работать":
         w = uwork(uid)
-        if not w: return send(peer_id, "❌ Сначала устройся на работу (/работы)")
+        if not w: return send(peer_id, "❌ Сначала /работы")
         cur.execute("SELECT salary, exp FROM jobs WHERE name=?", (w,)); j = cur.fetchone()
         if not j: return
         lw = ufield(uid, "work_last", 0); now = int(time.time())
         left = 86400 - (now - (lw or 0))
-        if left > 0: return send(peer_id, f"⏳ Отдыхай ещё {time_left_fmt(left)}")
+        if left > 0: return send(peer_id, f"⏳ Ещё {time_left_fmt(left)}")
         tbonus, _ = get_title_bonus(uid); bonus = tbonus * style_bonus()
         sal = int(j[0] * bonus); ex = int(j[1] * bonus)
         upd_bank(uid, sal)
         cur.execute("UPDATE users SET work_last=? WHERE user_id=?", (now, uid))
         nlv = add_exp(uid, ex); conn.commit()
-        txt = f"💼{style_div()}\n     ✅ СМЕНА ЗАВЕРШЕНА\n{style_div()}\n\n  💼 Работа: {w}\n  🏦 +{fmt(sal)} 💵 в банк\n  ⚡ +{ex} exp\n"
-        if nlv: txt += f"\n🎉 Ты достиг {nlv} уровня!"
+        txt = f"💼{style_div()}\n     ✅ СМЕНА\n{style_div()}\n\n  💼 {w}\n  🏦 +{fmt(sal)} 💵\n  ⚡ +{ex} exp\n"
+        if nlv: txt += f"\n🎉 Уровень {nlv}!"
         send(peer_id, txt + f"\n{style_div()}"); return
 
     # ============ БИЗНЕС ============
@@ -2455,7 +2630,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         c = ucountry(uid) or "—"
         ib = int(b[2] * style_bonus())
         cur.execute("INSERT INTO companies(owner,country,name,type,income) VALUES(?,?,?,?,?)", (uid, c, b[0], b[0], ib)); conn.commit()
-        send(peer_id, f"🏢 {b[0]} куплен за {fmt(b[1])} 💵\n💰 {fmt(ib)}/24ч в банк"); return
+        send(peer_id, f"🏢 {b[0]} за {fmt(b[1])} 💵\n💰 {fmt(ib)}/24ч в банк"); return
 
     if cmd == "/собрать":
         cur.execute("SELECT id,name,income FROM companies WHERE owner=?", (uid,)); rows = cur.fetchall()
@@ -2466,8 +2641,9 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         for cid,_,_ in rows: cur.execute("DELETE FROM companies WHERE id=?", (cid,))
         upd_bank(uid, total)
         cur.execute("UPDATE users SET biz=1 WHERE user_id=?", (uid,)); conn.commit()
-        msg = f"💼 Собрано {fmt(total)} 💵 в банк"
-        if dmult > 1: msg += f"\n  🛸 Бонус дрона: ×{dmult} (было бы {fmt(base_total)} 💵)"
+        _invalidate_user(uid)
+        msg = f"💼 Собрано {fmt(total)} 💵"
+        if dmult > 1: msg += f"\n  🛸 Дрон ×{dmult} (было {fmt(base_total)} 💵)"
         send(peer_id, msg); return
 
     if cmd == "/мбиз":
@@ -2483,12 +2659,12 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             c = ucountry(uid)
             if c:
                 co = get_country(c); fl = co[1] if co else "🏳️"
-                return send(peer_id, card("🌍 ВАШЕ ГРАЖДАНСТВО", [("👤", name_of(uid)), ("🌍", f"{fl} {c}"), ("💼", get_position(uid) or "Гражданин")], f"📝 Сменить: /гражданство <страна>"), kb_country())
+                return send(peer_id, card("🌍 ГРАЖДАНСТВО", [("👤", name_of(uid)), ("🌍", f"{fl} {c}"), ("💼", get_position(uid) or "Гражданин")], f"/гражданство <страна>"), kb_country())
             cur.execute("SELECT name,flag FROM countries WHERE alive=1 ORDER BY name")
             rows = cur.fetchall()
-            txt = f"{header('🌍 ВЫБОР ГРАЖДАНСТВА')}\n\n  У тебя пока нет гражданства.\n\n"
+            txt = f"{header('🌍 ГРАЖДАНСТВО')}\n\n"
             for n,f in rows: txt += f"  {f or '🏳️'} {n}\n"
-            txt += f"\n{style_div()}\n📝 /гражданство <название страны>"
+            txt += f"\n{style_div()}\n📝 /гражданство <страна>"
             return send(peer_id, txt, kb_country())
         cname = " ".join(args[1:]).strip()
         cur.execute("SELECT name,flag FROM countries WHERE LOWER(name)=LOWER(?) AND alive=1", (cname,))
@@ -2496,27 +2672,28 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not co:
             cur.execute("SELECT name,flag FROM countries WHERE LOWER(name) LIKE LOWER(?) AND alive=1", (f"%{cname}%",))
             co = cur.fetchone()
-        if not co: return send(peer_id, f"❌ Страна «{cname}» не найдена. Список: /страна")
+        if not co: return send(peer_id, f"❌ Не найдена. /страна")
         target_country, flag = co[0], co[1]
         old = ucountry(uid)
-        if old == target_country: return send(peer_id, f"❌ Ты уже гражданин {flag} {target_country}")
+        if old == target_country: return send(peer_id, f"❌ Уже гражданин {flag} {target_country}")
         if old: cur.execute("DELETE FROM members WHERE user_id=?", (uid,))
         cur.execute("UPDATE users SET country=? WHERE user_id=?", (target_country, uid))
         cur.execute("INSERT OR REPLACE INTO members(user_id,country,position) VALUES(?,?,?)", (uid, target_country, "Гражданин")); conn.commit()
-        if old: send(peer_id, f"✅ Гражданство изменено: {old} → {flag} {target_country}")
-        else:   send(peer_id, f"✅ Ты стал гражданином {flag} {target_country}!")
+        _invalidate_user(uid)
+        if old: send(peer_id, f"✅ {old} → {flag} {target_country}")
+        else:   send(peer_id, f"✅ Гражданин {flag} {target_country}!")
         return
 
     if cmd in ("/страны","/страна"):
         cur.execute("SELECT name,flag,treasury,army,cities,president FROM countries WHERE alive=1 ORDER BY cities DESC")
         rows = cur.fetchall()
         if not rows: return send(peer_id, "🌍 Нет стран", kb_country())
-        txt = header("СТРАНЫ МИРА")+"\n\n"
+        txt = header("СТРАНЫ")+"\n\n"
         for n,f,t,a,c,pr in rows[:25]:
             pn = name_of(pr) if pr else "❌"
             marker = " ⬅️" if ucountry(uid) == n else ""
             txt += f"  {f or '🏳️'} {n} | 👑 {pn} | ⚔️ {fmt(a)} | 🏙 {c}/40{marker}\n"
-        txt += f"\n{style_div()}\n📝 Вступить: /гражданство <страна>"
+        txt += f"\n{style_div()}\n📝 /гражданство <страна>"
         send(peer_id, txt, kb_country()); return
 
     if cmd in ("/паспорт","📘 паспорт"):
@@ -2560,7 +2737,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     # ============ ПИАР ============
     if cmd in ("/пиар","/pr"):
-        txt = f"{header('📢 ПИАР')}\n\n  💰 Оплата через владельца\n  📢 Рассылка только в PIAR-чаты\n\n  ⏱ ВЫБЕРИТЕ ИНТЕРВАЛ:\n\n"
+        txt = f"{header('📢 ПИАР')}\n\n  📢 Только PIAR-чаты\n\n  ⏱ ИНТЕРВАЛ:\n\n"
         btns = []; row = []
         for n in range(1, 21):
             pr = pr_auto_price(n)
@@ -2580,10 +2757,10 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("INSERT INTO pr_orders(user_id,tariff,price,status,created,duration,interval_min) VALUES(?,?,?,?,?,?,?)",
                     (uid, f"Пиар {n} мин", price, "wait_pay", int(time.time()), 0, n))
         conn.commit(); oid = cur.lastrowid
-        send(peer_id, card("📢 ЗАКАЗ ПИАРА", [("🔢",f"#{oid}"),("⏱ Интервал",f"каждые {n} мин"),("💰",f"{price} ₽"),("❓","🟡 Ожидает оплаты")], f"💳 @id{MAIN_OWNER}"))
+        send(peer_id, card("📢 ЗАКАЗ ПИАРА", [("🔢",f"#{oid}"),("⏱",f"каждые {n} мин"),("💰",f"{price} ₽"),("❓","🟡 Ожидает")], f"@id{MAIN_OWNER}"))
         link = get_chat_link(peer_id)
-        notif = (f"📢 НОВЫЙ ЗАКАЗ ПИАРА #{oid}\n\n  👤 Покупатель: {mention(uid)}\n  🔗 Ссылка на чат: {link}\n"
-                 f"  ⏱ Интервал: каждые {n} мин\n  💰 Сумма: {price} ₽\n\n✅ /pr_ok {oid}\n❌ /pr_no {oid}")
+        notif = (f"📢 ЗАКАЗ ПИАРА #{oid}\n\n  👤 {mention(uid)}\n  🔗 {link}\n"
+                 f"  ⏱ {n} мин\n  💰 {price} ₽\n\n✅ /pr_ok {oid}\n❌ /pr_no {oid}")
         for ow in OWNERS: send_uid(ow, notif)
         return
 
@@ -2609,7 +2786,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         o = cur.fetchone()
         if not o or o[1] not in ("wait_pay","paid"): return send(peer_id, "❌")
         cur.execute("UPDATE pr_orders SET status='confirmed', confirmed_by=?, paid_at=? WHERE id=?", (uid, int(time.time()), oid)); conn.commit()
-        send(peer_id, f"✅ #{oid} подтверждён\n📝 Отправьте текст пиара следующим сообщением:")
+        send(peer_id, f"✅ #{oid}\n📝 Отправьте текст следующим:")
         cur.execute("INSERT OR REPLACE INTO game_state(user_id,game,ts) VALUES(?,?,?)", (uid, f"pr_text:{oid}", int(time.time()))); conn.commit()
         send_uid(o[0], f"✅ Заказ #{oid} подтверждён!"); return
 
@@ -2621,7 +2798,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         cur.execute("SELECT user_id FROM pr_orders WHERE id=?", (oid,)); o = cur.fetchone()
         if not o: return
         cur.execute("UPDATE pr_orders SET status='cancelled' WHERE id=?", (oid,)); conn.commit()
-        send(peer_id, f"❌ #{oid} отменён"); send_uid(o[0], f"❌ Заказ #{oid} отклонён"); return
+        send(peer_id, f"❌ #{oid}"); send_uid(o[0], f"❌ Заказ #{oid} отклонён"); return
 
     # ============ РОЛИ ============
     if cmd == "/role":
@@ -2635,14 +2812,15 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if len(args) < 3: return
         t = extract_uid(args[1], event_msg)
         if not t: return
-        get_user(t)
         try: prio = max(0, min(101, int(args[2])))
         except: return
         cur.execute("SELECT name FROM roles WHERE priority=?", (prio,)); rr = cur.fetchone()
         rn = rr[0] if rr else f"Приоритет {prio}"
         if chat_id: cur.execute("INSERT OR REPLACE INTO user_roles(user_id,chat_id,role) VALUES(?,?,?)", (t, chat_id, rn))
+        cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
         cur.execute("UPDATE users SET role=?, priority=? WHERE user_id=?", (rn, prio, t))
-        pw = gen_password(); set_password(t, pw)
+        pw = gen_password(); set_password(t, pw); conn.commit()
+        _invalidate_user(t); _invalidate_priority(t)
         send(peer_id, f"✅ {mention(t)} → {rn} ({prio})")
         send_uid(t, f"🎭 Приоритет *{prio}*\n🔐 `{pw}`\n/adminpanel {pw}"); return
 
@@ -2651,14 +2829,15 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if len(args) < 3: return
         t = extract_uid(args[1], event_msg)
         if not t: return
-        get_user(t)
         try: prio = max(0, min(101, int(args[2])))
         except: return
         cur.execute("SELECT name FROM roles WHERE priority=?", (prio,)); rr = cur.fetchone()
         rn = rr[0] if rr else f"Приоритет {prio}"
         cur.execute("INSERT OR REPLACE INTO global_roles(user_id,role) VALUES(?,?)", (t, rn))
+        cur.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (t,))
         cur.execute("UPDATE users SET role=?, priority=? WHERE user_id=?", (rn, prio, t))
         pw = gen_password(); set_password(t, pw); conn.commit()
+        _invalidate_user(t); _invalidate_priority(t)
         ap = apply_global_role_everywhere(t)
         send(peer_id, f"🌐 {mention(t)} → {rn} ({prio})\n🏛 {ap} чатов")
         send_uid(t, f"🌐 Глобально *{prio}*\n🔐 `{pw}`\n/adminpanel {pw}"); return
@@ -2688,6 +2867,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
             t = uid; nick = " ".join(args[1:])
             if not nick: return
         cur.execute("INSERT OR REPLACE INTO nicks(user_id,nick) VALUES(?,?)", (t, nick)); conn.commit()
+        _name_cache.pop(t, None)
         send(peer_id, f"✅ {mention(t)}: {nick}"); return
 
     if cmd == "/обнулить":
@@ -2695,6 +2875,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         t = extract_uid(args[1] if len(args)>1 else None, event_msg)
         if not t: return
         cur.execute("UPDATE users SET balance=0, bank=0, warns=0 WHERE user_id=?", (t,)); conn.commit()
+        _invalidate_user(t)
         send(peer_id, f"♻️ {mention(t)}"); return
 
     if cmd == "/вайп":
@@ -2703,7 +2884,10 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         if not t or t in OWNERS: return
         cur.execute("UPDATE users SET balance=0, bank=0, warns=0, role='user', country=NULL, priority=0, exp=0, level=0, work=NULL, password=NULL, title=NULL, msg_count=0, mat_count=0, captures=0, drone_mult=1, drone_name=NULL WHERE user_id=?", (t,))
         for q in ["DELETE FROM user_roles WHERE user_id=?","DELETE FROM global_roles WHERE user_id=?","DELETE FROM companies WHERE owner=?","DELETE FROM nicks WHERE user_id=?","DELETE FROM members WHERE user_id=?"]: cur.execute(q, (t,))
-        conn.commit(); send(peer_id, f"💀 {mention(t)}"); return
+        conn.commit()
+        _invalidate_user(t); _invalidate_priority(t)
+        _name_cache.pop(t, None)
+        send(peer_id, f"💀 {mention(t)}"); return
 
     if cmd == "/выдать":
         if not is_owner(uid): return
@@ -2723,31 +2907,31 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
 
     if cmd == "/мтитул":
         bonus, _ = get_title_bonus(uid)
-        send(peer_id, card("МОЙ ТИТУЛ", [("👤",name_of(uid)),("⭐",utitle(uid) or "—"),("🎰 Титул",f"×{bonus}"),("🎨 Стиль",f"×{style_bonus()}")]), kb_back()); return
+        send(peer_id, card("МОЙ ТИТУЛ", [("👤",name_of(uid)),("⭐",utitle(uid) or "—"),("🎰",f"×{bonus}"),("🎨",f"×{style_bonus()}")]), kb_back()); return
 
     if cmd == "/promo":
         if len(args)<2: return send(peer_id, "📝 /promo <код>")
         code = args[1].upper()
         cur.execute("SELECT amount,uses,max_uses FROM promos WHERE code=?", (code,))
         p = cur.fetchone()
-        if not p: return send(peer_id, f"❌ Промокод `{code}` не найден")
+        if not p: return send(peer_id, f"❌ `{code}` не найден")
         amount, uses, max_uses = p
-        if uses >= max_uses: return send(peer_id, f"❌ Промокод `{code}` исчерпан\n👥 {uses}/{max_uses} активаций")
+        if uses >= max_uses: return send(peer_id, f"❌ `{code}` исчерпан\n👥 {uses}/{max_uses}")
         cur.execute("UPDATE promos SET uses=uses+1 WHERE code=?", (code,)); conn.commit()
         upd_balance(uid, amount)
-        send(peer_id, f"✅ Промокод `{code}` активирован!\n\n  💰 +{fmt(amount)} 💵\n  👥 Активаций: {uses+1}/{max_uses}\n\n  💳 Баланс: {fmt(get_balance(uid))} 💵"); return
+        send(peer_id, f"✅ `{code}` активирован!\n\n  💰 +{fmt(amount)} 💵\n  👥 {uses+1}/{max_uses}\n\n  💳 {fmt(get_balance(uid))} 💵"); return
 
     if cmd == "/createpromo":
         if not is_owner(uid): return send(peer_id, "❌ Только владелец")
-        if len(args) < 4: return send(peer_id, "📝 /createpromo <код> <сумма> <макс.активаций>")
+        if len(args) < 4: return send(peer_id, "📝 /createpromo <код> <сумма> <макс>")
         code = args[1].upper()
         try: a = int(args[2]); u = int(args[3])
-        except: return send(peer_id, "❌ Сумма и кол-во — числа")
-        if a <= 0 or u <= 0: return send(peer_id, "❌ Сумма и кол-во > 0")
+        except: return send(peer_id, "❌ Числа")
+        if a <= 0 or u <= 0: return send(peer_id, "❌ > 0")
         cur.execute("SELECT code FROM promos WHERE code=?", (code,))
-        if cur.fetchone(): return send(peer_id, f"❌ Промокод `{code}` уже существует")
+        if cur.fetchone(): return send(peer_id, f"❌ Уже существует")
         cur.execute("INSERT OR REPLACE INTO promos(code,amount,uses,max_uses) VALUES(?,?,0,?)", (code, a, u)); conn.commit()
-        send(peer_id, f"✅ Промокод создан\n\n{promo_card(code, a, 0, u)}"); return
+        send(peer_id, f"✅ Промокод\n\n{promo_card(code, a, 0, u)}"); return
 
     if cmd in ("/ивент","/мафия"):
         if chat_id: mafia_new(peer_id, uid, chat_id); return
@@ -2824,38 +3008,47 @@ def _startup_diagnostics():
                 if resp.status_code == 200:
                     with open(name, "wb") as f:
                         f.write(resp.content)
-                    log(f"✅ Скачан шрифт: {name} ({os.path.getsize(name)} байт)")
-                else:
-                    log(f"❌ Ошибка скачивания {name}: статус {resp.status_code}")
+                    log(f"✅ Скачан шрифт: {name}")
             except Exception as e:
-                log(f"❌ Ошибка скачивания {name}: {e}")
+                log(f"❌ Скачивание {name}: {e}")
 
-    log("🔍 ПРОВЕРКА ОКРУЖЕНИЯ:")
+    log("🔍 ПРОВЕРКА:")
     try:
         from PIL import Image, ImageFont
-        log("   ✅ Pillow установлен")
+        log("   ✅ Pillow")
         test_font_path = os.path.join(DATA_DIR, "font_regular.ttf")
-
         if os.path.exists(test_font_path) and os.path.getsize(test_font_path) > 100000:
             ImageFont.truetype(test_font_path, 20)
-            log("   ✅ Шрифт успешно загружен в Pillow")
+            log("   ✅ Шрифт")
         else:
-            log("   ❌ Шрифт не найден локально!")
+            log("   ❌ Шрифт не найден!")
     except Exception as e:
-        log(f"   ❌ Ошибка Pillow/шрифта: {e}")
+        log(f"   ❌ Pillow: {e}")
 
     try:
         import stats_card
-        log("   ✅ stats_card.py загружен")
+        log("   ✅ stats_card.py")
     except Exception as e:
-        log(f"   ❌ stats_card.py НЕ загружен: {e}")
+        log(f"   ❌ stats_card.py: {e}")
+
+# ============ ПАРАЛЛЕЛЬНАЯ ОБРАБОТКА ============
+def _process_event(peer_id, uid, text, message_id, msg):
+    lock = _get_peer_lock(peer_id)
+    with lock:
+        try:
+            handle_message(peer_id, uid, text, message_id, msg)
+        except sqlite3.OperationalError as e:
+            log(f"⚠️ DB busy (peer={peer_id}): {e}")
+        except Exception as e:
+            cmd_head = text.split()[0] if text.split() else '?'
+            log(f"❌ Handler (peer={peer_id}, cmd={cmd_head}): {type(e).__name__}: {e}")
 
 # ============ ЗАПУСК ============
 def main():
     global vk, longpoll
     log("⚔️ Бот запускается...")
     if longpoll is None or vk is None:
-        log("📡 Повторная инициализация VK в main()...")
+        log("📡 Повторная инициализация VK...")
         if not _init_vk():
             log("❌ Не удалось инициализировать VK"); return
     try:
@@ -2866,18 +3059,19 @@ def main():
                 cur.execute("UPDATE users SET role='Гл.Владелец', priority=101, balance=MAX(balance,999999999) WHERE user_id=?", (ow,))
             except: pass
         conn.commit()
+        for ow in OWNERS: _invalidate_user(ow)
         cur.execute("SELECT COUNT(*) FROM biz_types"); bc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM countries"); cc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM cities"); ctc = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM builds WHERE UPPER(type)='PIAR'"); pc = cur.fetchone()[0]
-        log(f"🏢 Бизнесов: {bc} | 🌍 Стран: {cc} | 🏙 Городов: {ctc} | 📢 PIAR-чатов: {pc}")
+        log(f"🏢 {bc} биз | 🌍 {cc} стран | 🏙 {ctc} городов | 📢 {pc} PIAR")
         log(f"🎨 Стиль: {style_name()}")
     except Exception as e:
-        log(f"⚠️ Ошибка при инициализации данных: {e}")
+        log(f"⚠️ Init: {e}")
 
     _startup_diagnostics()
 
-    log("🎧 Слушаю события...")
+    log("🎧 Слушаю события (параллельная обработка, 8 потоков)...")
     threading.Thread(target=pr_resend_worker, daemon=True).start()
     log("🔁 Авто-пиар воркер запущен")
 
@@ -2894,9 +3088,9 @@ def main():
                             event_id=eid, user_id=ev_uid, peer_id=ev_peer,
                             event_data=json.dumps({"type":"show_snackbar","text":"OK"}))
                         if isinstance(payload, dict) and payload.get("cmd"):
-                            handle_message(ev_peer, ev_uid, payload["cmd"])
+                            _event_pool.submit(_process_event, ev_peer, ev_uid, payload["cmd"], None, None)
                     except Exception as e:
-                        log(f"❌ Callback Error: {e}")
+                        log(f"❌ Callback: {e}")
                     continue
                 if event.type != VkBotEventType.MESSAGE_NEW:
                     continue
@@ -2916,16 +3110,11 @@ def main():
                     continue
                 if not text:
                     continue
+
                 try:
-                    handle_message(peer_id, uid, text, message_id, msg)
-                except sqlite3.OperationalError as e:
-                    log(f"⚠️ DB busy: {e}")
-                    time.sleep(0.3)
+                    _event_pool.submit(_process_event, peer_id, uid, text, message_id, msg)
                 except Exception as e:
-                    cmd_head = text.split()[0] if text.split() else '?'
-                    log(f"❌ Handler Error (peer={peer_id}, cmd={cmd_head}): {type(e).__name__}: {e}")
-                    if "Connection" in str(e) or "timeout" in str(e).lower():
-                        traceback.print_exc(file=sys.stdout)
+                    log(f"❌ Submit: {e}")
         except Exception as e:
             log(f"❌ LongPoll Error: {type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stdout)
