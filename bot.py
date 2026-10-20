@@ -57,8 +57,19 @@ if not os.path.exists(DATA_DIR):
 DB_PATH = os.path.join(DATA_DIR, 'bot.db')
 log(f"📁 База данных: {DB_PATH}")
 
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
 cur = conn.cursor()
+
+# ============ SQLITE ОПТИМИЗАЦИЯ ============
+try:
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.execute("PRAGMA cache_size=-64000")     # ~64 МБ кеша
+    cur.execute("PRAGMA temp_store=MEMORY")
+    cur.execute("PRAGMA busy_timeout=30000")
+    log("⚡ SQLite оптимизирован (WAL, 64MB cache)")
+except Exception as e:
+    log(f"⚠️ PRAGMA: {e}")
 
 def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 100,
@@ -237,6 +248,30 @@ def init_db():
     cur.execute("INSERT OR IGNORE INTO bot_settings(key,value) VALUES(?,?)", ("style","обычный"))
     cur.execute("INSERT OR IGNORE INTO bot_settings(key,value) VALUES(?,?)", ("drone_case_active","0"))
     cur.execute("INSERT OR IGNORE INTO bot_settings(key,value) VALUES(?,?)", ("season_active","0"))
+
+    # ===== ИНДЕКСЫ ДЛЯ СКОРОСТИ =====
+    for idx_sql in [
+        "CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_users_level ON users(level DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_users_country ON users(country)",
+        "CREATE INDEX IF NOT EXISTS idx_users_msg_count ON users(msg_count DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_cities_country ON cities(country)",
+        "CREATE INDEX IF NOT EXISTS idx_cities_owner ON cities(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_members_country ON members(country)",
+        "CREATE INDEX IF NOT EXISTS idx_members_user ON members(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_user_roles_chat ON user_roles(chat_id)",
+        "CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_companies_owner ON companies(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_bans_user ON bans(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_case_stats_user ON case_stats(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pr_orders_user ON pr_orders(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pr_orders_status ON pr_orders(status)",
+        "CREATE INDEX IF NOT EXISTS idx_builds_type ON builds(type)",
+        "CREATE INDEX IF NOT EXISTS idx_nicks_user ON nicks(user_id)",
+    ]:
+        try: cur.execute(idx_sql)
+        except: pass
+
     conn.commit()
 
 try:
@@ -244,14 +279,24 @@ try:
 except Exception as e:
     log(f"❌ Ошибка БД: {e}"); traceback.print_exc(file=sys.stdout); raise SystemExit(1)
 
-# ============ ЗАЩИТА ОТ ДУБЛИКАТОВ (ИСПРАВЛЕНО) ============
-_processed_ids = deque(maxlen=1000)
+# ============ ЗАЩИТА ОТ ДУБЛИКАТОВ (РАСШИРЕНА) ============
+_processed_ids = {}
+_processed_lock = threading.Lock()
+DEDUP_TTL = 600          # 10 минут
+DEDUP_MAX = 10000        # держим до 10k ключей
 
 def is_duplicate(peer_id, msg_id):
     key = f"{peer_id}_{msg_id}"
-    if key in _processed_ids: return True
-    _processed_ids.append(key)
-    return False
+    now = time.time()
+    with _processed_lock:
+        if key in _processed_ids:
+            return True
+        _processed_ids[key] = now
+        if len(_processed_ids) > DEDUP_MAX:
+            cutoff = now - DEDUP_TTL
+            for k in [k for k, v in _processed_ids.items() if v < cutoff]:
+                del _processed_ids[k]
+        return False
 
 # ============ МИГРАЦИИ ============
 def _col_exists(table, col):
@@ -281,7 +326,8 @@ for t, c, d in [
     ("users","drone_name","TEXT"),("users","daily_case_last","INTEGER DEFAULT 0"),
 ]:
     _add_col(t, c, d)
-    # ============ СТИЛЬ ============
+
+# ============ СТИЛЬ ============
 def load_style():
     global CURRENT_STYLE
     cur.execute("SELECT value FROM bot_settings WHERE key='style'")
@@ -420,7 +466,6 @@ _admin_cache = {}
 ADMIN_CACHE_TTL = 300
 
 def is_chat_admin(chat_id, uid):
-    """Проверяет, есть ли у ЮЗЕРА права администратора в этом чате"""
     if uid in OWNERS: return True
     now = time.time()
     cache_key = ("user", chat_id, uid)
@@ -439,8 +484,7 @@ def is_chat_admin(chat_id, uid):
     return False
 
 def bot_is_chat_admin(chat_id):
-    """Проверяет, есть ли у САМОГО БОТА права администратора в этом чате"""
-    if not chat_id: return True  # В ЛС всегда можно
+    if not chat_id: return True
     now = time.time()
     cache_key = ("bot", chat_id)
     if cache_key in _admin_cache and now - _admin_cache[cache_key][1] < ADMIN_CACHE_TTL:
@@ -448,7 +492,7 @@ def bot_is_chat_admin(chat_id):
     try:
         res = vk.messages.getConversationMembers(peer_id=2000000000+chat_id)
         for item in res.get('items', []):
-            if item.get('member_id', 0) < 0:  # Бот имеет отрицательный ID
+            if item.get('member_id', 0) < 0:
                 result = item.get('is_admin', False) or item.get('is_owner', False)
                 _admin_cache[cache_key] = (result, now)
                 return result
@@ -458,7 +502,6 @@ def bot_is_chat_admin(chat_id):
     return False
 
 def can_punish(uid, chat_id):
-    """Может ли юзер наказать в этом чате (стафф бота + бот админ в чате)"""
     if not is_admin(uid): return False
     return bot_is_chat_admin(chat_id)
 
@@ -490,15 +533,26 @@ def is_bot_disabled(peer_id):
     cur.execute("SELECT peer_id FROM bot_disabled WHERE peer_id=?", (peer_id,))
     return bool(cur.fetchone())
 
+# ============ КЕШ name_of ============
+_name_cache = {}
+NAME_CACHE_TTL = 1800
+
 def name_of(uid):
     emoji = get_user_emoji(uid)
     cur.execute("SELECT nick FROM nicks WHERE user_id=?", (uid,)); r = cur.fetchone()
     nick = r[0] if r and r[0] else None
     if not nick:
-        try:
-            u = vk.users.get(user_ids=uid)[0]
-            nick = f"{u['first_name']} {u['last_name']}"
-        except: nick = f"id{uid}"
+        now = time.time()
+        cached = _name_cache.get(uid)
+        if cached and now - cached[1] < NAME_CACHE_TTL:
+            nick = cached[0]
+        else:
+            try:
+                u = vk.users.get(user_ids=uid)[0]
+                nick = f"{u['first_name']} {u['last_name']}"
+                _name_cache[uid] = (nick, now)
+            except:
+                nick = f"id{uid}"
     custom = utitle(uid)
     if custom: return f"{emoji} {custom} {nick}"
     return f"{emoji} {nick}"
@@ -631,26 +685,44 @@ def _init_vk():
 if not _init_vk():
     log("⚠️ VK не инициализирован на старте — попробуем в main()")
 
-def send(peer_id, text, keyboard=None, attachment=None):
-    try:
-        kw = {"peer_id": peer_id, "message": text, "random_id": get_random_id()}
-        if peer_id < 2000000000 and keyboard:
-            kw["keyboard"] = keyboard
-        if attachment:
-            kw["attachment"] = attachment
-        vk.messages.send(**kw)
-    except Exception as e:
-        log(f"❌ Send peer={peer_id}: {e}")
-        if "keyboard" in kw:
-            try:
-                del kw["keyboard"]
-                vk.messages.send(**kw)
-            except Exception as e2:
-                log(f"❌ Send без kb: {e2}")
+# ============ ОТПРАВКА С РЕТРАЯМИ ============
+def send(peer_id, text, keyboard=None, attachment=None, retries=3):
+    kw = {"peer_id": peer_id, "message": text, "random_id": get_random_id()}
+    if peer_id < 2000000000 and keyboard:
+        kw["keyboard"] = keyboard
+    if attachment:
+        kw["attachment"] = attachment
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            vk.messages.send(**kw)
+            return True
+        except Exception as e:
+            last_err = e
+            err_s = str(e).lower()
+            if "flood" in err_s or "too many" in err_s or err_s.strip() == "9":
+                if attempt < retries:
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+            if "keyboard" in kw and attempt == retries - 1:
+                try:
+                    del kw["keyboard"]
+                    vk.messages.send(**kw)
+                    return True
+                except Exception as e2:
+                    last_err = e2
+            break
+    log(f"❌ Send peer={peer_id} после {retries+1} попыток: {last_err}")
+    return False
 
 def send_uid(user_id, text, keyboard=None):
-    try: vk.messages.send(user_id=user_id, message=text, random_id=get_random_id(), keyboard=keyboard)
-    except Exception as e: log(f"❌ SendUID: {e}")
+    try:
+        vk.messages.send(user_id=user_id, message=text, random_id=get_random_id(), keyboard=keyboard)
+        return True
+    except Exception as e:
+        log(f"❌ SendUID: {e}")
+        return False
 
 def delete_message(peer_id, mid):
     try: vk.messages.delete(message_ids=mid, delete_for_all=1); return True
@@ -755,7 +827,6 @@ def send_stats_card(peer_id, uid, chat_id=None):
     cached = _stats_cache.get(uid)
     if cached and now - cached[1] < STATS_CACHE_TTL:
         try:
-            # ДОБАВЛЕН ТЕКСТ, ЧТОБЫ ВК НЕ БЛОКИРОВАЛ ФОТО В БЕСЕДЕ
             vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=cached[0])
             return True
         except Exception as e:
@@ -777,10 +848,8 @@ def send_stats_card(peer_id, uid, chat_id=None):
     try:
         u = build_stats_user_dict(uid, chat_id)
         bg_url = "https://i.postimg.cc/4x3XfLZW/ffaa3ac666ac63e26a51b9b22f83fcf8.jpg"
-        
         avatar_url = u.get("avatar_url", "")
         path = render_card(bg_url, u, avatar_url=avatar_url, out_path=f"stats_{uid}.png")
-        
         log(f"✅ Картинка сгенерирована: {path}")
     except Exception as e:
         log(f"❌ render_card: {type(e).__name__}: {e}")
@@ -795,7 +864,6 @@ def send_stats_card(peer_id, uid, chat_id=None):
         return False
 
     try:
-        # Отправляем с текстом "📸 Профиль"
         vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=att)
         _stats_cache[uid] = (att, now)
         log(f"✅ /стата отправлена (peer={peer_id}, att={att})")
@@ -911,7 +979,8 @@ def promo_card(code, amount, uses, max_uses):
     return (f"{style_div()}\n     {style_emoji()} 🎟️ ПРОМОКОД {style_emoji()}\n{style_div()}\n\n"
             f"  🔑 ➜ `{code}`\n  💰 ➜ {fmt(amount)} 💵\n  👥 ➜ {uses} / {max_uses} активаций\n"
             f"  📊 ➜ Осталось: {left}\n  {status}\n\n{style_div()}")
-    # ============ ИГРЫ ============
+
+# ============ ИГРЫ ============
 def play_game(peer_id, uid, game, bet):
     if bet <= 0: return send(peer_id, "❌ Ставка > 0")
     if get_balance(uid) < bet: return send(peer_id, f"❌ Мало!\n💳 {fmt(get_balance(uid))} 💵")
@@ -1545,7 +1614,7 @@ def build_help_owner():
 ⚔️ /война /захват /мир /запуск /дрон
 
 📊 /мойстат — моя статистика
-🔐 /adminpa
+🔐 /adminpanel <пароль>
 📖 /ghelp
 {style_div()}"""
 
@@ -1603,7 +1672,8 @@ def handle_ticket_action(cmd):
         cur.execute("UPDATE tickets SET status='closed' WHERE id=?", (tid,)); conn.commit()
         return "🚫 Флуд"
     return None
-    # ============ ОСНОВНОЙ ОБРАБОТЧИК ============
+
+# ============ ОСНОВНОЙ ОБРАБОТЧИК ============
 def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     text = text.strip(); low = text.lower()
     if low in TEXT_ALIASES: text = TEXT_ALIASES[low]
@@ -1694,6 +1764,28 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     if cmd.startswith("/tk"):
         res = handle_ticket_action(text)
         if res: send(peer_id, res)
+        return
+
+    # ============ ADMINPANEL ============
+    if cmd == "/adminpanel":
+        if len(args) < 2:
+            return send(peer_id, "📝 /adminpanel <пароль>")
+        pw = args[1]
+        stored = upassword(uid)
+        if stored and pw == stored:
+            prio = get_priority(uid)
+            cur.execute("SELECT role FROM roles WHERE priority=?", (prio,))
+            rn = cur.fetchone()
+            role_name = rn[0] if rn else f"Приоритет {prio}"
+            send(peer_id, f"{header('🔐 ADMIN PANEL')}\n\n"
+                          f"  👤 {name_of(uid)}\n"
+                          f"  🎭 Роль: {role_name}\n"
+                          f"  📊 Приоритет: {prio}\n\n"
+                          f"  📖 /ahelp — команды модерации\n"
+                          f"  📖 /ghelp — команды владельца\n"
+                          f"{style_div()}")
+        else:
+            send(peer_id, "❌ Неверный пароль")
         return
 
     # ============ КЕЙСЫ ============
@@ -1896,12 +1988,10 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     # ============ СТАТА ============
     if cmd == "/стата":
         t = extract_uid(args[1] if len(args)>1 else None, event_msg) or uid
-        
-        # Пытаемся отправить картинку
+
         if send_stats_card(peer_id, t, chat_id):
             return
-            
-        # Если картинка не удалась — шлём текстом
+
         lvl = ulevel(t); exp = uexp(t); need = (lvl+1)*100
         prog = get_progress_bar(exp, need, 8)
         pct = int((exp/need)*100) if need > 0 else 0
@@ -1915,7 +2005,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
         vip = "Да" if is_vip(t) else "Нет"
         drone_name = udrone_name(t) or "Нет"
         drone_mult = udrone_mult(t)
-        
+
         txt = (f"━━━━━━━━━━━━━━━━━━━━\n"
                f"👤  {name_of(t).upper()}\n"
                f"Monster PROFILE\n"
@@ -2725,7 +2815,7 @@ def _startup_diagnostics():
         os.path.join(DATA_DIR, "font_regular.ttf"): "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Regular.ttf",
         os.path.join(DATA_DIR, "font_bold.ttf"): "https://cdn.jsdelivr.net/gh/googlefonts/roboto@main/src/hinted/Roboto-Bold.ttf"
     }
-    
+
     for name, url in fonts.items():
         if not os.path.exists(name) or os.path.getsize(name) < 100000:
             try:
@@ -2745,7 +2835,7 @@ def _startup_diagnostics():
         from PIL import Image, ImageFont
         log("   ✅ Pillow установлен")
         test_font_path = os.path.join(DATA_DIR, "font_regular.ttf")
-        
+
         if os.path.exists(test_font_path) and os.path.getsize(test_font_path) > 100000:
             ImageFont.truetype(test_font_path, 20)
             log("   ✅ Шрифт успешно загружен в Pillow")
@@ -2753,7 +2843,7 @@ def _startup_diagnostics():
             log("   ❌ Шрифт не найден локально!")
     except Exception as e:
         log(f"   ❌ Ошибка Pillow/шрифта: {e}")
-        
+
     try:
         import stats_card
         log("   ✅ stats_card.py загружен")
@@ -2782,7 +2872,7 @@ def main():
         cur.execute("SELECT COUNT(*) FROM builds WHERE UPPER(type)='PIAR'"); pc = cur.fetchone()[0]
         log(f"🏢 Бизнесов: {bc} | 🌍 Стран: {cc} | 🏙 Городов: {ctc} | 📢 PIAR-чатов: {pc}")
         log(f"🎨 Стиль: {style_name()}")
-    except Exception as e: 
+    except Exception as e:
         log(f"⚠️ Ошибка при инициализации данных: {e}")
 
     _startup_diagnostics()
@@ -2805,36 +2895,37 @@ def main():
                             event_data=json.dumps({"type":"show_snackbar","text":"OK"}))
                         if isinstance(payload, dict) and payload.get("cmd"):
                             handle_message(ev_peer, ev_uid, payload["cmd"])
-                    except Exception as e: 
+                    except Exception as e:
                         log(f"❌ Callback Error: {e}")
                     continue
-                if event.type != VkBotEventType.MESSAGE_NEW: 
+                if event.type != VkBotEventType.MESSAGE_NEW:
                     continue
                 msg = event.object.message
                 peer_id = msg['peer_id']; uid = msg['from_id']
                 message_id = msg['id']; text = msg.get('text','')
                 action = msg.get('action')
 
-                if text:
-                    log(f"📩 ВХОДЯЩЕЕ: peer={peer_id} uid={uid} text={text}")
-
                 if is_duplicate(peer_id, message_id):
-                    log(f"⚠️ Дубликат: {peer_id}_{message_id}")
                     continue
 
                 if action:
                     if action.get('type') in ('chat_invite_user','chat_invite_user_by_link'):
                         member = action.get('member_id')
-                        if member and member > 0: 
+                        if member and member > 0:
                             handle_chat_invite(peer_id, member)
                     continue
-                if not text: 
+                if not text:
                     continue
-                try: 
+                try:
                     handle_message(peer_id, uid, text, message_id, msg)
+                except sqlite3.OperationalError as e:
+                    log(f"⚠️ DB busy: {e}")
+                    time.sleep(0.3)
                 except Exception as e:
-                    log(f"❌ Handler Error: {e}")
-                    traceback.print_exc(file=sys.stdout)
+                    cmd_head = text.split()[0] if text.split() else '?'
+                    log(f"❌ Handler Error (peer={peer_id}, cmd={cmd_head}): {type(e).__name__}: {e}")
+                    if "Connection" in str(e) or "timeout" in str(e).lower():
+                        traceback.print_exc(file=sys.stdout)
         except Exception as e:
             log(f"❌ LongPoll Error: {type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stdout)
