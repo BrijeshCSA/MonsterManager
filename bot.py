@@ -244,12 +244,13 @@ try:
 except Exception as e:
     log(f"❌ Ошибка БД: {e}"); traceback.print_exc(file=sys.stdout); raise SystemExit(1)
 
-# ============ ЗАЩИТА ОТ ДУБЛИКАТОВ ============
+# ============ ЗАЩИТА ОТ ДУБЛИКАТОВ (ИСПРАВЛЕНО) ============
 _processed_ids = deque(maxlen=1000)
 
-def is_duplicate(msg_id):
-    if msg_id in _processed_ids: return True
-    _processed_ids.append(msg_id)
+def is_duplicate(peer_id, msg_id):
+    key = f"{peer_id}_{msg_id}"
+    if key in _processed_ids: return True
+    _processed_ids.append(key)
     return False
 
 # ============ МИГРАЦИИ ============
@@ -438,7 +439,7 @@ def is_chat_admin(chat_id, uid):
     return False
 
 def bot_is_chat_admin(chat_id):
-    """Проверяет, есть ли у БОТА права администратора в этом чате"""
+    """Проверяет, есть ли у САМОГО БОТА права администратора в этом чате"""
     if not chat_id: return True  # В ЛС всегда можно
     now = time.time()
     cache_key = ("bot", chat_id)
@@ -754,6 +755,7 @@ def send_stats_card(peer_id, uid, chat_id=None):
     cached = _stats_cache.get(uid)
     if cached and now - cached[1] < STATS_CACHE_TTL:
         try:
+            # ДОБАВЛЕН ТЕКСТ, ЧТОБЫ ВК НЕ БЛОКИРОВАЛ ФОТО В БЕСЕДЕ
             vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=cached[0])
             return True
         except Exception as e:
@@ -793,7 +795,7 @@ def send_stats_card(peer_id, uid, chat_id=None):
         return False
 
     try:
-        # Обязательно передаем текст, иначе VK может отклонить фото в беседе
+        # Отправляем с текстом "📸 Профиль"
         vk.messages.send(peer_id=peer_id, message="📸 Профиль", random_id=get_random_id(), attachment=att)
         _stats_cache[uid] = (att, now)
         log(f"✅ /стата отправлена (peer={peer_id}, att={att})")
@@ -2812,7 +2814,11 @@ def main():
                 message_id = msg['id']; text = msg.get('text','')
                 action = msg.get('action')
 
-                if is_duplicate(message_id):
+                if text:
+                    log(f"📩 ВХОДЯЩЕЕ: peer={peer_id} uid={uid} text={text}")
+
+                if is_duplicate(peer_id, message_id):
+                    log(f"⚠️ Дубликат проигнорирован: {peer_id}_{message_id}")
                     continue
 
                 if action:
