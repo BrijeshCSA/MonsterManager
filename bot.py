@@ -1652,6 +1652,7 @@ def handle_message(peer_id, uid, text, message_id=None, event_msg=None):
     args = text.split(); cmd = args[0].lower() if args else ""
     chat_id = peer_to_chat(peer_id)
 
+    # Обработка /stop и /start идет до всех проверок
     if cmd == "/stop":
         if not is_owner(uid): return
         cur.execute("INSERT OR REPLACE INTO bot_disabled(peer_id,since) VALUES(?,?)", (peer_id, int(time.time())))
@@ -2818,7 +2819,7 @@ def main():
                     log(f"📩 ВХОДЯЩЕЕ: peer={peer_id} uid={uid} text={text}")
 
                 if is_duplicate(peer_id, message_id):
-                    log(f"⚠️ Дубликат проигнорирован: {peer_id}_{message_id}")
+                    log(f"⚠️ Дубликат: {peer_id}_{message_id}")
                     continue
 
                 if action:
